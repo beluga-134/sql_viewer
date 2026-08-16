@@ -4,8 +4,9 @@
 
 ## 功能
 
-- 打开 Parquet、CSV、TSV、JSON、JSONL 和 NDJSON 文件
+- 打开 Parquet、CSV、TSV、JSON、JSONL、NDJSON 和 DuckDB（`.duckdb`/`.db`/`.ddb`）文件
 - 每个文件注册为独立 DuckDB View，可跨文件 JOIN
+- 以只读方式连接 DuckDB 数据库中的表和视图，可直接使用三段式名称查询
 - 展示字段名、DuckDB 类型、文件大小和行数
 - SQL 查询与本地查询历史
 - 结果表格固定表头和行号
@@ -52,6 +53,14 @@ FROM "orders"
 LIMIT 500;
 ```
 
+DuckDB 文件中的对象会显示为 `数据库别名.模式.表名`，查询时使用三段式名称：
+
+```sql
+SELECT *
+FROM "analytics"."main"."orders"
+LIMIT 500;
+```
+
 多个文件可以直接 JOIN：
 
 ```sql
@@ -62,7 +71,7 @@ LEFT JOIN "categories" b ON a.category_id = b.id;
 
 ## 架构
 
-- `src/duckdb.ts`：DuckDB-WASM 初始化、文件注册和查询
+- `src/duckdb.ts`：DuckDB-WASM 初始化、文件注册、DuckDB attach 和查询
 - `src/xlsx.ts`：ExcelJS 工作簿生成
 - `src/backend.ts`：Tauri 与浏览器文件读写适配
 - `src-tauri/`：Windows 桌面壳和原生文件读写命令

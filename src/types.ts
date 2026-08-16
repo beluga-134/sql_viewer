@@ -1,4 +1,4 @@
-export type SourceFormat = "parquet" | "csv" | "json";
+export type SourceFormat = "parquet" | "csv" | "json" | "duckdb";
 
 export interface LocalFilePayload {
   name: string;
@@ -18,11 +18,15 @@ export interface DataSource {
   name: string;
   path: string | null;
   alias: string;
+  sqlName: string;
   virtualName: string;
   format: SourceFormat;
   size: number;
   rowCount: number;
   columns: SourceColumn[];
+  databaseId?: string;
+  databaseAlias?: string;
+  objectKind?: "TABLE" | "VIEW";
 }
 
 export type CellValue = string | number | boolean | null;

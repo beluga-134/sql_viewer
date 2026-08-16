@@ -15,7 +15,7 @@ export async function chooseSourcePaths(): Promise<string[]> {
     filters: [
       {
         name: "数据文件",
-        extensions: ["parquet", "pq", "csv", "tsv", "json", "jsonl", "ndjson"],
+        extensions: ["parquet", "pq", "csv", "tsv", "json", "jsonl", "ndjson", "duckdb", "db", "ddb"],
       },
       { name: "所有文件", extensions: ["*"] },
     ],

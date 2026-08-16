@@ -183,8 +183,86 @@ export async function registerSource(
   }
 }
 
+export type DuckDBObjectMetadata = {
+  schema: string;
+  name: string;
+  kind: "TABLE" | "VIEW";
+  sqlName: string;
+  columns: SourceColumn[];
+  rowCount: number;
+};
+
+export async function registerDuckDBSource(
+  virtualName: string,
+  databaseAlias: string,
+  data: Uint8Array,
+): Promise<DuckDBObjectMetadata[]> {
+  const { db, connection } = requireEngine();
+  await db.registerFileBuffer(virtualName, data);
+  const database = quoteIdentifier(databaseAlias);
+  try {
+    await connection.query(`ATTACH ${quoteString(virtualName)} AS ${database} (READ_ONLY)`);
+    const tables = tableToRows(
+      await connection.query(
+        `SELECT schema_name, table_name FROM duckdb_tables() ` +
+          `WHERE database_name = ${quoteString(databaseAlias)} ` +
+          `AND schema_name NOT IN ('information_schema', 'pg_catalog') ` +
+          `ORDER BY schema_name, table_name`,
+      ),
+    );
+    const views = tableToRows(
+      await connection.query(
+        `SELECT schema_name, view_name FROM duckdb_views() ` +
+          `WHERE database_name = ${quoteString(databaseAlias)} ` +
+          `AND schema_name NOT IN ('information_schema', 'pg_catalog') ` +
+          `ORDER BY schema_name, view_name`,
+      ),
+    );
+    const objects = [
+      ...tables.rows.map((row) => ({ schema: String(row[0]), name: String(row[1]), kind: "TABLE" as const })),
+      ...views.rows.map((row) => ({ schema: String(row[0]), name: String(row[1]), kind: "VIEW" as const })),
+    ];
+    const metadata = await Promise.all(objects.map(async (object) => {
+      const relation = `${database}.${quoteIdentifier(object.schema)}.${quoteIdentifier(object.name)}`;
+      const columns = tableToRows(
+        await connection.query(
+          `SELECT column_name, data_type, is_nullable FROM duckdb_columns() ` +
+            `WHERE database_name = ${quoteString(databaseAlias)} ` +
+            `AND schema_name = ${quoteString(object.schema)} ` +
+            `AND table_name = ${quoteString(object.name)} ` +
+            `ORDER BY column_index`,
+        ),
+      ).rows.map((row) => ({
+        name: String(row[0] ?? ""),
+        type: String(row[1] ?? "UNKNOWN"),
+        nullable: String(row[2] ?? "YES"),
+      }));
+      const count = tableToRows(await connection.query(`SELECT count(*) FROM ${relation}`));
+      return {
+        ...object,
+        sqlName: relation,
+        columns,
+        rowCount: Number(count.rows[0]?.[0] ?? 0),
+      };
+    }));
+    if (metadata.length === 0) {
+      throw new Error("DuckDB 文件中没有可显示的表或视图");
+    }
+    return metadata;
+  } catch (error) {
+    await connection.query(`DETACH ${database}`).catch(() => undefined);
+    await db.dropFile(virtualName).catch(() => undefined);
+    throw error;
+  }
+}
+
 export async function unregisterSource(source: DataSource): Promise<void> {
   const { db, connection } = requireEngine();
+  if (source.databaseAlias) {
+    await connection.query(`DETACH ${quoteIdentifier(source.databaseAlias)}`);
+    await db.dropFile(source.virtualName).catch(() => undefined);
+    return;
+  }
   await connection.query(`DROP VIEW IF EXISTS ${quoteIdentifier(source.alias)}`);
   await db.dropFile(source.virtualName).catch(() => undefined);
 }
@@ -199,6 +277,6 @@ export async function executeSql(sql: string): Promise<QueryResult> {
   };
 }
 
-export function defaultQuery(alias: string): string {
-  return `SELECT *\nFROM ${quoteIdentifier(alias)}\nLIMIT 500;`;
+export function defaultQuery(sqlName: string): string {
+  return `SELECT *\nFROM ${sqlName}\nLIMIT 500;`;
 }

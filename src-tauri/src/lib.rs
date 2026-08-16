@@ -16,7 +16,7 @@ fn allowed_extension(path: &Path) -> bool {
         .map(|extension| {
             matches!(
                 extension.to_ascii_lowercase().as_str(),
-                "parquet" | "pq" | "csv" | "tsv" | "json" | "jsonl" | "ndjson"
+                "parquet" | "pq" | "csv" | "tsv" | "json" | "jsonl" | "ndjson" | "duckdb" | "db" | "ddb"
             )
         })
         .unwrap_or(false)
@@ -78,6 +78,7 @@ mod tests {
         assert!(allowed_extension(Path::new("sample.parquet")));
         assert!(allowed_extension(Path::new("sample.CSV")));
         assert!(allowed_extension(Path::new("sample.jsonl")));
+        assert!(allowed_extension(Path::new("sample.duckdb")));
         assert!(!allowed_extension(Path::new("sample.xlsx")));
     }
 }

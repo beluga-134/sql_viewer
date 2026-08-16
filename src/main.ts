@@ -24,6 +24,7 @@ import {
   defaultQuery,
   executeSql,
   initializeEngine,
+  registerDuckDBSource,
   registerSource,
   unregisterSource,
 } from "./duckdb";
@@ -127,7 +128,7 @@ app.innerHTML = `
     </footer>
   </main>
 
-  <input id="browser-file-input" type="file" accept=".parquet,.pq,.csv,.tsv,.json,.jsonl,.ndjson" multiple hidden />
+  <input id="browser-file-input" type="file" accept=".parquet,.pq,.csv,.tsv,.json,.jsonl,.ndjson,.duckdb,.db,.ddb" multiple hidden />
   <div class="drop-overlay" id="drop-overlay" hidden>
     <div><i data-lucide="file-input"></i><strong>松开以打开文件</strong></div>
   </div>
@@ -195,10 +196,11 @@ function detectFormat(name: string): SourceFormat | null {
   if (extension === "parquet" || extension === "pq") return "parquet";
   if (extension === "csv" || extension === "tsv") return "csv";
   if (extension === "json" || extension === "jsonl" || extension === "ndjson") return "json";
+  if (extension === "duckdb" || extension === "db" || extension === "ddb") return "duckdb";
   return null;
 }
 
-function sourceAlias(name: string): string {
+function sourceAlias(name: string, reserved: string[] = []): string {
   const withoutExtension = name.replace(/\.[^.]+$/, "");
   let alias = withoutExtension
     .normalize("NFKC")
@@ -208,7 +210,13 @@ function sourceAlias(name: string): string {
   if (/^\d/.test(alias)) alias = `data_${alias}`;
   const base = alias;
   let ordinal = 2;
-  while (sources.some((source) => source.alias.toLowerCase() === alias.toLowerCase())) {
+  while (
+    reserved.some((item) => item.toLowerCase() === alias.toLowerCase()) ||
+    sources.some((source) =>
+      source.alias.toLowerCase() === alias.toLowerCase() ||
+      source.databaseAlias?.toLowerCase() === alias.toLowerCase(),
+    )
+  ) {
     alias = `${base}_${ordinal}`;
     ordinal += 1;
   }
@@ -335,12 +343,15 @@ function renderSources(): void {
     const name = document.createElement("strong");
     name.textContent = source.alias;
     const details = document.createElement("small");
-    details.textContent = `${source.format.toUpperCase()} · ${formatNumber(source.rowCount)} 行 · ${formatBytes(source.size)}`;
+    const formatLabel = source.format === "duckdb"
+      ? `DUCKDB ${source.objectKind ?? "TABLE"}`
+      : source.format.toUpperCase();
+    details.textContent = `${formatLabel} · ${formatNumber(source.rowCount)} 行 · ${formatBytes(source.size)}`;
     copy.append(name, details);
     select.append(copy);
     select.addEventListener("click", () => {
       selectedSourceId = source.id;
-      editor.value = defaultQuery(source.alias);
+      editor.value = defaultQuery(source.sqlName);
       renderSources();
       renderSchema();
       setBusy(busy);
@@ -448,32 +459,59 @@ async function addSources(pendingSources: PendingSource[]): Promise<void> {
     }
     const id = crypto.randomUUID();
     const extension = format === "parquet" ? "parquet" : format;
-    const source: DataSource = {
-      id,
-      name: pending.name,
-      path: pending.path,
-      alias: sourceAlias(pending.name),
-      virtualName: `source_${id.replace(/-/g, "")}.${extension}`,
-      format,
-      size: pending.size,
-      rowCount: 0,
-      columns: [],
-    };
+    const virtualName = `source_${id.replace(/-/g, "")}.${extension}`;
     setStatus(`正在解析 ${index + 1}/${pendingSources.length}：${pending.name}`);
     try {
-      const metadata = await registerSource(source, pending.data);
-      source.columns = metadata.columns;
-      source.rowCount = metadata.rowCount;
-      sources.push(source);
-      selectedSourceId = source.id;
-      added += 1;
+      if (format === "duckdb") {
+        const databaseId = id;
+        const databaseAlias = sourceAlias(pending.name, ["main", "temp"]);
+        const objects = await registerDuckDBSource(virtualName, databaseAlias, pending.data);
+        const databaseSources = objects.map((object) => ({
+          id: crypto.randomUUID(),
+          name: `${pending.name} / ${object.schema}.${object.name}`,
+          path: pending.path,
+          alias: `${databaseAlias}.${object.schema}.${object.name}`,
+          sqlName: object.sqlName,
+          virtualName,
+          format,
+          size: pending.size,
+          rowCount: object.rowCount,
+          columns: object.columns,
+          databaseId,
+          databaseAlias,
+          objectKind: object.kind,
+        } satisfies DataSource));
+        sources.push(...databaseSources);
+        selectedSourceId = databaseSources[0]?.id ?? null;
+        added += databaseSources.length;
+      } else {
+        const alias = sourceAlias(pending.name);
+        const source: DataSource = {
+          id,
+          name: pending.name,
+          path: pending.path,
+          alias,
+          sqlName: quoteAlias(alias),
+          virtualName,
+          format,
+          size: pending.size,
+          rowCount: 0,
+          columns: [],
+        };
+        const metadata = await registerSource(source, pending.data);
+        source.columns = metadata.columns;
+        source.rowCount = metadata.rowCount;
+        sources.push(source);
+        selectedSourceId = source.id;
+        added += 1;
+      }
     } catch (error) {
       showToast(`${pending.name}：${error instanceof Error ? error.message : "打开失败"}`, "error");
     }
   }
   if (added > 0) {
     const source = selectedSource();
-    if (source) editor.value = defaultQuery(source.alias);
+    if (source) editor.value = defaultQuery(source.sqlName);
     showToast(`已打开 ${added} 个数据文件`);
   }
   renderSources();
@@ -513,12 +551,20 @@ async function removeSource(source: DataSource): Promise<void> {
   if (busy) return;
   setBusy(true, `正在移除 ${source.alias}`);
   try {
+    const removedSelected = source.databaseId
+      ? sources.some((item) => item.databaseId === source.databaseId && item.id === selectedSourceId)
+      : selectedSourceId === source.id;
     await unregisterSource(source);
-    sources = sources.filter((item) => item.id !== source.id);
-    if (selectedSourceId === source.id) {
+    const removedIds = new Set(
+      source.databaseId
+        ? sources.filter((item) => item.databaseId === source.databaseId).map((item) => item.id)
+        : [source.id],
+    );
+    sources = sources.filter((item) => !removedIds.has(item.id));
+    if (removedSelected) {
       selectedSourceId = sources.at(-1)?.id ?? null;
       const next = selectedSource();
-      if (next) editor.value = defaultQuery(next.alias);
+      if (next) editor.value = defaultQuery(next.sqlName);
     }
     renderSources();
     setBusy(false, `已移除 ${source.alias}`);
