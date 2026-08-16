@@ -4,7 +4,7 @@ export interface LocalFilePayload {
   name: string;
   path: string;
   size: number;
-  data: number[];
+  data?: number[];
 }
 
 export interface SourceColumn {
@@ -24,9 +24,14 @@ export interface DataSource {
   size: number;
   rowCount: number;
   columns: SourceColumn[];
+  metadataLoaded?: boolean;
+  metadataLoading?: boolean;
+  native?: boolean;
+  schema?: string;
+  objectName?: string;
   databaseId?: string;
   databaseAlias?: string;
-  objectKind?: "TABLE" | "VIEW";
+  objectKind?: "TABLE" | "VIEW" | "FILE";
 }
 
 export type CellValue = string | number | boolean | null;
@@ -37,4 +42,5 @@ export interface QueryResult {
   rows: CellValue[][];
   rowCount: number;
   elapsedMs: number;
+  truncated?: boolean;
 }

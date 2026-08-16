@@ -1,6 +1,25 @@
 import { invoke } from "@tauri-apps/api/core";
 
-import type { LocalFilePayload } from "./types";
+import type { LocalFilePayload, QueryResult, SourceColumn, SourceFormat } from "./types";
+
+export type NativeSourceSpec = {
+  path: string;
+  alias: string;
+  format: SourceFormat;
+};
+
+export type NativeObject = {
+  databaseAlias?: string;
+  schema: string;
+  name: string;
+  kind: "TABLE" | "VIEW" | "FILE";
+  sqlName: string;
+};
+
+export type NativeMetadata = {
+  columns: SourceColumn[];
+  rowCount: number;
+};
 
 export function isTauriRuntime(): boolean {
   return "__TAURI_INTERNALS__" in window;
@@ -24,8 +43,32 @@ export async function chooseSourcePaths(): Promise<string[]> {
   return Array.isArray(selected) ? selected : [selected];
 }
 
-export async function readLocalFile(path: string): Promise<LocalFilePayload> {
-  return invoke<LocalFilePayload>("read_local_file", { path });
+export async function getLocalFileInfo(path: string): Promise<LocalFilePayload> {
+  return invoke<LocalFilePayload>("get_local_file_info", { path });
+}
+
+export async function listNativeObjects(source: NativeSourceSpec): Promise<NativeObject[]> {
+  return invoke<NativeObject[]>("list_native_objects", { source });
+}
+
+export async function describeNativeObject(
+  source: NativeSourceSpec & { schema: string; objectName: string },
+): Promise<NativeMetadata> {
+  return invoke<NativeMetadata>("describe_native_object", {
+    source: {
+      ...source,
+      schema: source.schema,
+      objectName: source.objectName,
+    },
+  });
+}
+
+export async function executeNativeSql(sql: string, sources: NativeSourceSpec[]): Promise<QueryResult> {
+  return invoke<QueryResult>("execute_native_sql", { sql, sources });
+}
+
+export async function cancelNativeSql(): Promise<void> {
+  await invoke<void>("cancel_native_sql");
 }
 
 export async function saveWorkbook(data: Uint8Array, suggestedName: string): Promise<boolean> {

@@ -188,9 +188,25 @@ export type DuckDBObjectMetadata = {
   name: string;
   kind: "TABLE" | "VIEW";
   sqlName: string;
-  columns: SourceColumn[];
-  rowCount: number;
 };
+
+export async function describeDuckDBObject(
+  databaseAlias: string,
+  schemaName: string,
+  objectName: string,
+): Promise<{ columns: SourceColumn[]; rowCount: number }> {
+  const { connection } = requireEngine();
+  const relation = `${quoteIdentifier(databaseAlias)}.${quoteIdentifier(schemaName)}.${quoteIdentifier(objectName)}`;
+  const columns = tableToRows(
+    await connection.query(`DESCRIBE SELECT * FROM ${relation}`),
+  ).rows.map((row) => ({
+    name: String(row[0] ?? ""),
+    type: String(row[1] ?? "UNKNOWN"),
+    nullable: String(row[2] ?? "YES"),
+  }));
+  const count = tableToRows(await connection.query(`SELECT count(*) FROM ${relation}`));
+  return { columns, rowCount: Number(count.rows[0]?.[0] ?? 0) };
+}
 
 export async function registerDuckDBSource(
   virtualName: string,
@@ -222,28 +238,9 @@ export async function registerDuckDBSource(
       ...tables.rows.map((row) => ({ schema: String(row[0]), name: String(row[1]), kind: "TABLE" as const })),
       ...views.rows.map((row) => ({ schema: String(row[0]), name: String(row[1]), kind: "VIEW" as const })),
     ];
-    const metadata = await Promise.all(objects.map(async (object) => {
-      const relation = `${database}.${quoteIdentifier(object.schema)}.${quoteIdentifier(object.name)}`;
-      const columns = tableToRows(
-        await connection.query(
-          `SELECT column_name, data_type, is_nullable FROM duckdb_columns() ` +
-            `WHERE database_name = ${quoteString(databaseAlias)} ` +
-            `AND schema_name = ${quoteString(object.schema)} ` +
-            `AND table_name = ${quoteString(object.name)} ` +
-            `ORDER BY column_index`,
-        ),
-      ).rows.map((row) => ({
-        name: String(row[0] ?? ""),
-        type: String(row[1] ?? "UNKNOWN"),
-        nullable: String(row[2] ?? "YES"),
-      }));
-      const count = tableToRows(await connection.query(`SELECT count(*) FROM ${relation}`));
-      return {
-        ...object,
-        sqlName: relation,
-        columns,
-        rowCount: Number(count.rows[0]?.[0] ?? 0),
-      };
+    const metadata = objects.map((object) => ({
+      ...object,
+      sqlName: `${database}.${quoteIdentifier(object.schema)}.${quoteIdentifier(object.name)}`,
     }));
     if (metadata.length === 0) {
       throw new Error("DuckDB 文件中没有可显示的表或视图");

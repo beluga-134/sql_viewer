@@ -1,13 +1,14 @@
 use serde::Serialize;
 use std::path::Path;
 
+mod native_db;
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct LocalFilePayload {
     name: String,
     path: String,
     size: u64,
-    data: Vec<u8>,
 }
 
 fn allowed_extension(path: &Path) -> bool {
@@ -16,23 +17,32 @@ fn allowed_extension(path: &Path) -> bool {
         .map(|extension| {
             matches!(
                 extension.to_ascii_lowercase().as_str(),
-                "parquet" | "pq" | "csv" | "tsv" | "json" | "jsonl" | "ndjson" | "duckdb" | "db" | "ddb"
+                "parquet"
+                    | "pq"
+                    | "csv"
+                    | "tsv"
+                    | "json"
+                    | "jsonl"
+                    | "ndjson"
+                    | "duckdb"
+                    | "db"
+                    | "ddb"
             )
         })
         .unwrap_or(false)
 }
 
 #[tauri::command(async)]
-fn read_local_file(path: String) -> Result<LocalFilePayload, String> {
+fn get_local_file_info(path: String) -> Result<LocalFilePayload, String> {
     let file_path = Path::new(&path);
     if !allowed_extension(file_path) {
         return Err("不支持该文件格式".into());
     }
-    let metadata = std::fs::metadata(file_path).map_err(|error| format!("无法读取文件信息：{error}"))?;
+    let metadata =
+        std::fs::metadata(file_path).map_err(|error| format!("无法读取文件信息：{error}"))?;
     if !metadata.is_file() {
         return Err("所选路径不是文件".into());
     }
-    let data = std::fs::read(file_path).map_err(|error| format!("无法读取文件：{error}"))?;
     let name = file_path
         .file_name()
         .and_then(|name| name.to_str())
@@ -42,7 +52,6 @@ fn read_local_file(path: String) -> Result<LocalFilePayload, String> {
         name,
         path,
         size: metadata.len(),
-        data,
     })
 }
 
@@ -64,7 +73,15 @@ fn write_binary_file(path: String, data: Vec<u8>) -> Result<(), String> {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![read_local_file, write_binary_file])
+        .manage(native_db::NativeAppState::default())
+        .invoke_handler(tauri::generate_handler![
+            get_local_file_info,
+            write_binary_file,
+            native_db::list_native_objects,
+            native_db::describe_native_object,
+            native_db::execute_native_sql,
+            native_db::cancel_native_sql
+        ])
         .run(tauri::generate_context!())
         .expect("error while running SQL Viewer");
 }

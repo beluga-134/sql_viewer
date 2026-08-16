@@ -19,9 +19,20 @@ import {
 } from "lucide";
 
 import "./styles.css";
-import { chooseSourcePaths, isTauriRuntime, readLocalFile, saveWorkbook } from "./backend";
+import {
+  cancelNativeSql,
+  chooseSourcePaths,
+  describeNativeObject,
+  executeNativeSql,
+  getLocalFileInfo,
+  isTauriRuntime,
+  listNativeObjects,
+  saveWorkbook,
+} from "./backend";
+import type { NativeSourceSpec } from "./backend";
 import {
   defaultQuery,
+  describeDuckDBObject,
   executeSql,
   initializeEngine,
   registerDuckDBSource,
@@ -94,6 +105,9 @@ app.innerHTML = `
             <button class="secondary-button" id="export-xlsx" disabled>
               <i data-lucide="file-spreadsheet"></i><span>导出 XLSX</span>
             </button>
+            <button class="secondary-button" id="cancel-query" hidden>
+              <i data-lucide="x"></i><span>取消</span>
+            </button>
           </div>
           <label class="history-control">
             <i data-lucide="clock-3"></i>
@@ -151,6 +165,7 @@ const sourceSearch = query<HTMLInputElement>("#source-search");
 const editor = query<HTMLTextAreaElement>("#sql-editor");
 const runButton = query<HTMLButtonElement>("#run-query");
 const exportButton = query<HTMLButtonElement>("#export-xlsx");
+const cancelButton = query<HTMLButtonElement>("#cancel-query");
 const historySelect = query<HTMLSelectElement>("#query-history");
 const resultHost = query<HTMLDivElement>("#result-host");
 const resultMeta = query<HTMLDivElement>("#result-meta");
@@ -165,7 +180,9 @@ let selectedSourceId: string | null = null;
 let currentResult: QueryResult | null = null;
 let engineReady = false;
 let busy = false;
+let queryRunning = false;
 let toastTimer = 0;
+let cancelRequested = false;
 
 const HISTORY_KEY = "sql-viewer.query-history.v1";
 const MAX_RENDER_ROWS = 2500;
@@ -248,6 +265,7 @@ function setBusy(nextBusy: boolean, message?: string): void {
   busy = nextBusy;
   runButton.disabled = !engineReady || busy || !editor.value.trim();
   exportButton.disabled = busy || !currentResult || currentResult.columns.length === 0;
+  cancelButton.hidden = !isTauriRuntime() || !queryRunning;
   if (message) setStatus(message);
   document.body.classList.toggle("busy", busy);
 }
@@ -284,6 +302,13 @@ function renderSchema(): void {
     const empty = document.createElement("div");
     empty.className = "schema-empty";
     empty.textContent = "未选择数据源";
+    schemaList.append(empty);
+    return;
+  }
+  if (!source.metadataLoaded) {
+    const empty = document.createElement("div");
+    empty.className = "schema-empty";
+    empty.textContent = source.metadataLoading ? "正在加载字段" : "点击数据源加载字段和行数";
     schemaList.append(empty);
     return;
   }
@@ -346,17 +371,13 @@ function renderSources(): void {
     const formatLabel = source.format === "duckdb"
       ? `DUCKDB ${source.objectKind ?? "TABLE"}`
       : source.format.toUpperCase();
-    details.textContent = `${formatLabel} · ${formatNumber(source.rowCount)} 行 · ${formatBytes(source.size)}`;
+    const metadata = source.metadataLoaded
+      ? `${formatNumber(source.rowCount)} 行`
+      : "点击加载字段";
+    details.textContent = `${formatLabel} · ${metadata} · ${formatBytes(source.size)}`;
     copy.append(name, details);
     select.append(copy);
-    select.addEventListener("click", () => {
-      selectedSourceId = source.id;
-      editor.value = defaultQuery(source.sqlName);
-      renderSources();
-      renderSchema();
-      setBusy(busy);
-      editor.focus();
-    });
+    select.addEventListener("click", () => void selectSource(source));
 
     const remove = document.createElement("button");
     remove.type = "button";
@@ -436,7 +457,8 @@ function renderResult(): void {
   const renderedSuffix = currentResult.rowCount > MAX_RENDER_ROWS
     ? ` · 屏幕显示前 ${formatNumber(MAX_RENDER_ROWS)} 行`
     : "";
-  resultMeta.textContent = `${formatNumber(currentResult.rowCount)} 行 · ${currentResult.columns.length} 列 · ${currentResult.elapsedMs.toFixed(0)} ms${renderedSuffix}`;
+  const truncatedSuffix = currentResult.truncated ? " · 已达到 100,000 行安全上限" : "";
+  resultMeta.textContent = `${formatNumber(currentResult.rowCount)} 行 · ${currentResult.columns.length} 列 · ${currentResult.elapsedMs.toFixed(0)} ms${renderedSuffix}${truncatedSuffix}`;
   exportButton.disabled = busy;
 }
 
@@ -444,8 +466,106 @@ type PendingSource = {
   name: string;
   path: string | null;
   size: number;
-  data: Uint8Array;
+  data?: Uint8Array;
 };
+
+function nativeSourceSpec(source: DataSource): NativeSourceSpec {
+  if (!source.path) throw new Error("桌面数据源缺少文件路径");
+  return {
+    path: source.path,
+    alias: source.databaseAlias ?? source.alias,
+    format: source.format,
+  };
+}
+
+async function loadSourceMetadata(source: DataSource): Promise<void> {
+  if (source.metadataLoaded || source.metadataLoading) return;
+  if (!source.schema || !source.objectName) return;
+  source.metadataLoading = true;
+  renderSources();
+  setBusy(true, `正在读取 ${source.alias} 的字段`);
+  try {
+    const metadata = source.native
+      ? await describeNativeObject({
+        ...nativeSourceSpec(source),
+        schema: source.schema,
+        objectName: source.objectName,
+      })
+      : await describeDuckDBObject(source.databaseAlias!, source.schema, source.objectName);
+    source.columns = metadata.columns;
+    source.rowCount = metadata.rowCount;
+    source.metadataLoaded = true;
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : "读取字段失败", "error");
+  } finally {
+    source.metadataLoading = false;
+    renderSources();
+    setBusy(false, source.metadataLoaded ? `已加载 ${source.alias} 的字段` : "读取字段失败");
+  }
+}
+
+async function selectSource(source: DataSource): Promise<void> {
+  if (busy) return;
+  selectedSourceId = source.id;
+  editor.value = defaultQuery(source.sqlName);
+  renderSources();
+  renderSchema();
+  setBusy(false);
+  editor.focus();
+  await loadSourceMetadata(source);
+}
+
+async function addNativeSources(paths: string[]): Promise<void> {
+  if (!engineReady || paths.length === 0) return;
+  setBusy(true, `正在枚举 ${paths.length} 个数据文件`);
+  let added = 0;
+  for (const [index, path] of paths.entries()) {
+    try {
+      const info = await getLocalFileInfo(path);
+      const format = detectFormat(info.name);
+      if (!format) {
+        showToast(`${info.name}：不支持该文件格式`, "error");
+        continue;
+      }
+      const alias = sourceAlias(info.name, ["main", "temp"]);
+      setStatus(`正在枚举 ${index + 1}/${paths.length}：${info.name}`);
+      const objects = await listNativeObjects({ path: info.path, alias, format });
+      const databaseId = format === "duckdb" ? crypto.randomUUID() : undefined;
+      const databaseSources = objects.map((object) => ({
+        id: crypto.randomUUID(),
+        name: `${info.name} / ${object.schema}.${object.name}`,
+        path: info.path,
+        alias: format === "duckdb" ? `${alias}.${object.schema}.${object.name}` : alias,
+        sqlName: object.sqlName,
+        virtualName: "",
+        format,
+        size: info.size,
+        rowCount: 0,
+        columns: [],
+        metadataLoaded: false,
+        native: true,
+        databaseId,
+        databaseAlias: object.databaseAlias,
+        schema: object.schema,
+        objectName: object.name,
+        objectKind: object.kind,
+      } satisfies DataSource));
+      sources.push(...databaseSources);
+      selectedSourceId = databaseSources[0]?.id ?? selectedSourceId;
+      added += databaseSources.length;
+    } catch (error) {
+      showToast(`${path}：${error instanceof Error ? error.message : "打开失败"}`, "error");
+    }
+  }
+  if (added > 0) {
+    const source = selectedSource();
+    if (source) editor.value = defaultQuery(source.sqlName);
+    showToast(`已枚举 ${added} 个数据源对象`);
+  }
+  renderSources();
+  setBusy(false, added > 0 ? `已加载 ${sources.length} 个数据源对象` : "未加载数据源");
+  editor.focus();
+}
 
 async function addSources(pendingSources: PendingSource[]): Promise<void> {
   if (!engineReady || pendingSources.length === 0) return;
@@ -462,6 +582,7 @@ async function addSources(pendingSources: PendingSource[]): Promise<void> {
     const virtualName = `source_${id.replace(/-/g, "")}.${extension}`;
     setStatus(`正在解析 ${index + 1}/${pendingSources.length}：${pending.name}`);
     try {
+      if (!pending.data) throw new Error("浏览器文件数据不可用");
       if (format === "duckdb") {
         const databaseId = id;
         const databaseAlias = sourceAlias(pending.name, ["main", "temp"]);
@@ -475,10 +596,13 @@ async function addSources(pendingSources: PendingSource[]): Promise<void> {
           virtualName,
           format,
           size: pending.size,
-          rowCount: object.rowCount,
-          columns: object.columns,
+          rowCount: 0,
+          columns: [],
+          metadataLoaded: false,
           databaseId,
           databaseAlias,
+          schema: object.schema,
+          objectName: object.name,
           objectKind: object.kind,
         } satisfies DataSource));
         sources.push(...databaseSources);
@@ -497,6 +621,7 @@ async function addSources(pendingSources: PendingSource[]): Promise<void> {
           size: pending.size,
           rowCount: 0,
           columns: [],
+          metadataLoaded: true,
         };
         const metadata = await registerSource(source, pending.data);
         source.columns = metadata.columns;
@@ -528,19 +653,7 @@ async function openSources(): Promise<void> {
   try {
     const paths = await chooseSourcePaths();
     if (paths.length === 0) return;
-    setBusy(true, `正在读取 ${paths.length} 个文件`);
-    const pending: PendingSource[] = [];
-    for (const path of paths) {
-      const payload = await readLocalFile(path);
-      pending.push({
-        name: payload.name,
-        path: payload.path,
-        size: payload.size,
-        data: Uint8Array.from(payload.data),
-      });
-    }
-    setBusy(false);
-    await addSources(pending);
+    await addNativeSources(paths);
   } catch (error) {
     setBusy(false, "打开文件失败");
     showToast(error instanceof Error ? error.message : "打开文件失败", "error");
@@ -554,7 +667,7 @@ async function removeSource(source: DataSource): Promise<void> {
     const removedSelected = source.databaseId
       ? sources.some((item) => item.databaseId === source.databaseId && item.id === selectedSourceId)
       : selectedSourceId === source.id;
-    await unregisterSource(source);
+    if (!source.native) await unregisterSource(source);
     const removedIds = new Set(
       source.databaseId
         ? sources.filter((item) => item.databaseId === source.databaseId).map((item) => item.id)
@@ -574,20 +687,36 @@ async function removeSource(source: DataSource): Promise<void> {
   }
 }
 
+function nativeQuerySources(): NativeSourceSpec[] {
+  const unique = new Map<string, NativeSourceSpec>();
+  for (const source of sources) {
+    if (!source.native) continue;
+    const spec = nativeSourceSpec(source);
+    unique.set(`${spec.path}\0${spec.alias}\0${spec.format}`, spec);
+  }
+  return Array.from(unique.values());
+}
+
 async function runQuery(): Promise<void> {
   const sql = editor.value.trim();
   if (!sql || busy || !engineReady) return;
+  queryRunning = true;
   setBusy(true, "正在执行查询");
+  cancelRequested = false;
   try {
-    currentResult = await executeSql(sql);
+    currentResult = isTauriRuntime() ? await executeNativeSql(sql, nativeQuerySources()) : await executeSql(sql);
     saveHistory(sql);
     renderResult();
+    queryRunning = false;
     setBusy(false, `查询完成：${formatNumber(currentResult.rowCount)} 行`);
   } catch (error) {
     currentResult = null;
     renderResult();
-    setBusy(false, "查询失败");
-    showToast(error instanceof Error ? error.message : "查询失败", "error");
+    const canceled = cancelRequested;
+    cancelRequested = false;
+    queryRunning = false;
+    setBusy(false, canceled ? "查询已取消" : "查询失败");
+    if (!canceled) showToast(error instanceof Error ? error.message : "查询失败", "error");
   }
 }
 
@@ -620,6 +749,11 @@ function browserFiles(files: FileList | File[]): Promise<PendingSource[]> {
 query<HTMLButtonElement>("#add-source").addEventListener("click", () => void openSources());
 runButton.addEventListener("click", () => void runQuery());
 exportButton.addEventListener("click", () => void exportResult());
+cancelButton.addEventListener("click", async () => {
+  if (!queryRunning || !isTauriRuntime()) return;
+  cancelRequested = true;
+  await cancelNativeSql();
+});
 sourceSearch.addEventListener("input", renderSources);
 editor.addEventListener("input", () => setBusy(busy));
 editor.addEventListener("keydown", (event) => {
@@ -649,31 +783,49 @@ toast.querySelector("button")!.addEventListener("click", () => {
   toast.hidden = true;
 });
 
-window.addEventListener("dragover", (event) => {
-  if (!event.dataTransfer?.types.includes("Files")) return;
-  event.preventDefault();
-  dropOverlay.hidden = false;
-});
-window.addEventListener("dragleave", (event) => {
-  if (event.relatedTarget === null) dropOverlay.hidden = true;
-});
-window.addEventListener("drop", async (event) => {
-  event.preventDefault();
-  dropOverlay.hidden = true;
-  if (event.dataTransfer?.files.length) {
-    await addSources(await browserFiles(event.dataTransfer.files));
+async function initializeDropHandling(): Promise<void> {
+  if (isTauriRuntime()) {
+    const { getCurrentWebview } = await import("@tauri-apps/api/webview");
+    await getCurrentWebview().onDragDropEvent((event) => {
+      if (event.payload.type === "enter" || event.payload.type === "over") {
+        dropOverlay.hidden = false;
+      } else if (event.payload.type === "drop") {
+        dropOverlay.hidden = true;
+        void addNativeSources(event.payload.paths);
+      } else {
+        dropOverlay.hidden = true;
+      }
+    });
+    return;
   }
-});
+
+  window.addEventListener("dragover", (event) => {
+    if (!event.dataTransfer?.types.includes("Files")) return;
+    event.preventDefault();
+    dropOverlay.hidden = false;
+  });
+  window.addEventListener("dragleave", (event) => {
+    if (event.relatedTarget === null) dropOverlay.hidden = true;
+  });
+  window.addEventListener("drop", async (event) => {
+    event.preventDefault();
+    dropOverlay.hidden = true;
+    if (event.dataTransfer?.files.length) {
+      await addSources(await browserFiles(event.dataTransfer.files));
+    }
+  });
+}
 
 async function start(): Promise<void> {
   renderHistory();
   renderSources();
   setBusy(false, "正在初始化 DuckDB");
   try {
-    await initializeEngine();
+    if (!isTauriRuntime()) await initializeEngine();
+    await initializeDropHandling();
     engineReady = true;
     engineState.classList.add("ready");
-    engineState.innerHTML = `<i data-lucide="circle-check"></i><span>DuckDB 就绪</span>`;
+    engineState.innerHTML = `<i data-lucide="circle-check"></i><span>${isTauriRuntime() ? "原生 DuckDB 就绪" : "DuckDB-WASM 就绪"}</span>`;
     createIcons({ icons: iconSet });
     setBusy(false, "DuckDB 已就绪");
     editor.focus();

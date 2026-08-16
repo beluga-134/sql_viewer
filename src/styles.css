@@ -26,6 +26,10 @@
   letter-spacing: 0;
 }
 
+[hidden] {
+  display: none !important;
+}
+
 html,
 body,
 #app {
