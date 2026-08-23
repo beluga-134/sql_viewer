@@ -1,0 +1,23 @@
+[package]
+name = "sql-viewer"
+version = "0.1.0"
+description = "A lightweight local SQL viewer for Parquet and tabular files"
+authors = ["Gluga"]
+edition = "2021"
+
+[lib]
+name = "sql_viewer_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2.6.3", features = [] }
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+duckdb = { version = "1.10505.0", features = ["bundled", "chrono"] }
+tauri = { version = "2.11.5", features = [] }
+tauri-plugin-dialog = "2"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+webkit2gtk = "=2.0.2"
