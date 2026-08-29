@@ -32,6 +32,49 @@ fn allowed_extension(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn database_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| {
+            matches!(
+                extension.to_ascii_lowercase().as_str(),
+                "duckdb" | "db" | "ddb"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn collect_database_files(directory: &Path, files: &mut Vec<String>) -> Result<(), String> {
+    for entry in std::fs::read_dir(directory).map_err(|error| format!("无法读取目录：{error}"))?
+    {
+        let entry = entry.map_err(|error| format!("无法读取目录项：{error}"))?;
+        let file_type = entry
+            .file_type()
+            .map_err(|error| format!("无法读取目录项类型：{error}"))?;
+        let path = entry.path();
+        if file_type.is_dir() {
+            collect_database_files(&path, files)?;
+        } else if file_type.is_file() && database_extension(&path) {
+            files.push(path.to_string_lossy().into_owned());
+        }
+    }
+    Ok(())
+}
+
+#[tauri::command(async)]
+fn list_database_files(path: String) -> Result<Vec<String>, String> {
+    let directory = Path::new(&path);
+    let metadata =
+        std::fs::metadata(directory).map_err(|error| format!("无法读取目录信息：{error}"))?;
+    if !metadata.is_dir() {
+        return Err("所选路径不是目录".into());
+    }
+    let mut files = Vec::new();
+    collect_database_files(directory, &mut files)?;
+    files.sort_unstable_by_key(|item| item.to_ascii_lowercase());
+    Ok(files)
+}
+
 #[tauri::command(async)]
 fn get_local_file_info(path: String) -> Result<LocalFilePayload, String> {
     let file_path = Path::new(&path);
@@ -76,8 +119,10 @@ pub fn run() {
         .manage(native_db::NativeAppState::default())
         .invoke_handler(tauri::generate_handler![
             get_local_file_info,
+            list_database_files,
             write_binary_file,
             native_db::list_native_objects,
+            native_db::list_native_object_columns,
             native_db::describe_native_object,
             native_db::execute_native_sql,
             native_db::cancel_native_sql

@@ -9,6 +9,9 @@ import {
   FileInput,
   FileSpreadsheet,
   Files,
+  Folder,
+  FolderOpen,
+  FolderPlus,
   LoaderCircle,
   Play,
   Plus,
@@ -22,10 +25,13 @@ import "./styles.css";
 import {
   cancelNativeSql,
   chooseSourcePaths,
+  chooseDatabaseDirectory,
   describeNativeObject,
   executeNativeSql,
   getLocalFileInfo,
+  listDatabaseFiles,
   isTauriRuntime,
+  listNativeObjectColumns,
   listNativeObjects,
   saveWorkbook,
 } from "./backend";
@@ -52,6 +58,9 @@ const iconSet = {
   FileInput,
   FileSpreadsheet,
   Files,
+  Folder,
+  FolderOpen,
+  FolderPlus,
   LoaderCircle,
   Play,
   Plus,
@@ -80,14 +89,28 @@ app.innerHTML = `
     <div class="workspace">
       <aside class="source-panel" aria-label="数据源">
         <div class="panel-heading">
-          <div><span>数据源</span><em id="source-count">0</em></div>
-          <button class="icon-button" id="add-source" title="打开数据文件" aria-label="打开数据文件">
-            <i data-lucide="plus"></i>
-          </button>
+          <div class="panel-title"><span>数据源</span><em id="source-count">0</em></div>
+          <div class="panel-actions">
+            <div class="recent-databases" id="recent-databases" ${isTauriRuntime() ? "" : "hidden"}>
+              <button class="icon-button" id="recent-database-button" title="最近打开的数据库" aria-label="最近打开的数据库" aria-haspopup="menu" aria-expanded="false" aria-controls="recent-database-menu" disabled>
+                <i data-lucide="clock-3"></i>
+              </button>
+              <div class="recent-database-menu" id="recent-database-menu" role="menu" hidden></div>
+            </div>
+            <button class="icon-button" id="open-database-directory" title="扫描数据库目录" aria-label="扫描数据库目录" ${isTauriRuntime() ? "" : "hidden"}>
+              <i data-lucide="folder-open"></i>
+            </button>
+            <button class="icon-button" id="add-project-directory" title="新建项目目录" aria-label="新建项目目录" ${isTauriRuntime() ? "" : "hidden"}>
+              <i data-lucide="folder-plus"></i>
+            </button>
+            <button class="icon-button" id="add-source" title="打开数据文件" aria-label="打开数据文件">
+              <i data-lucide="plus"></i>
+            </button>
+          </div>
         </div>
         <div class="source-search">
           <i data-lucide="search"></i>
-          <input id="source-search" type="search" placeholder="筛选文件" autocomplete="off" />
+          <input id="source-search" type="search" placeholder="筛选表或字段" autocomplete="off" />
         </div>
         <div class="source-list" id="source-list"></div>
         <div class="schema-panel">
@@ -162,6 +185,11 @@ function query<T extends Element>(selector: string): T {
 const sourceList = query<HTMLDivElement>("#source-list");
 const schemaList = query<HTMLDivElement>("#schema-list");
 const sourceSearch = query<HTMLInputElement>("#source-search");
+const recentDatabases = query<HTMLDivElement>("#recent-databases");
+const recentDatabaseButton = query<HTMLButtonElement>("#recent-database-button");
+const recentDatabaseMenu = query<HTMLDivElement>("#recent-database-menu");
+const databaseDirectoryButton = query<HTMLButtonElement>("#open-database-directory");
+const addProjectDirectoryButton = query<HTMLButtonElement>("#add-project-directory");
 const editor = query<HTMLTextAreaElement>("#sql-editor");
 const runButton = query<HTMLButtonElement>("#run-query");
 const exportButton = query<HTMLButtonElement>("#export-xlsx");
@@ -183,8 +211,22 @@ let busy = false;
 let queryRunning = false;
 let toastTimer = 0;
 let cancelRequested = false;
+let columnFilters: string[] = [];
+const collapsedSourceGroups = new Set<string>();
+const collapsedSchemas = new Set<string>();
+const collapsedProjectDirectories = new Set<string>();
+const scanningProjectFolders = new Set<string>();
+
+type ProjectDirectory = { id: string; name: string };
+type ProjectFolder = { id: string; directoryId: string; name: string; path: string };
+type SourceGroup = { key: string; label: string; sources: DataSource[] };
 
 const HISTORY_KEY = "sql-viewer.query-history.v1";
+const RECENT_DATABASES_KEY = "sql-viewer.recent-databases.v1";
+const PROJECT_DIRECTORIES_KEY = "sql-viewer.project-directories.v1";
+const PROJECT_FOLDERS_KEY = "sql-viewer.project-folders.v1";
+const SOURCES_KEY = "sql-viewer.sources.v1";
+const MAX_RECENT_DATABASES = 10;
 const MAX_RENDER_ROWS = 2500;
 
 function readHistory(): string[] {
@@ -197,6 +239,105 @@ function readHistory(): string[] {
 }
 
 let queryHistory = readHistory();
+
+function readRecentDatabases(): string[] {
+  try {
+    const parsed: unknown = JSON.parse(localStorage.getItem(RECENT_DATABASES_KEY) ?? "[]");
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+      .filter((path, index, paths) => paths.indexOf(path) === index)
+      .slice(0, MAX_RECENT_DATABASES);
+  } catch {
+    return [];
+  }
+}
+
+let recentDatabasePaths = readRecentDatabases();
+
+function readStoredList<T>(key: string): T[] {
+  try {
+    const parsed: unknown = JSON.parse(localStorage.getItem(key) ?? "[]");
+    return Array.isArray(parsed) ? parsed as T[] : [];
+  } catch {
+    return [];
+  }
+}
+
+let projectDirectories = readStoredList<ProjectDirectory>(PROJECT_DIRECTORIES_KEY)
+  .filter((item) => item && typeof item.id === "string" && typeof item.name === "string");
+let projectFolders = readStoredList<ProjectFolder>(PROJECT_FOLDERS_KEY)
+  .filter((item) => item && typeof item.id === "string" && typeof item.directoryId === "string" && typeof item.path === "string");
+sources = readStoredList<DataSource>(SOURCES_KEY)
+  .filter((item) => item && item.native === true && typeof item.id === "string" && typeof item.path === "string" && typeof item.sqlName === "string")
+  .filter((item) => !item.projectFolderId || projectFolders.some((folder) => folder.id === item.projectFolderId));
+for (const source of sources) {
+  if (source.projectFolderId && source.databaseId) collapsedSourceGroups.add(`database:${source.databaseId}`);
+}
+
+function saveProjectState(): void {
+  localStorage.setItem(PROJECT_DIRECTORIES_KEY, JSON.stringify(projectDirectories));
+  localStorage.setItem(PROJECT_FOLDERS_KEY, JSON.stringify(projectFolders));
+}
+
+function saveSources(): void {
+  try {
+    localStorage.setItem(SOURCES_KEY, JSON.stringify(sources.filter((source) => source.native && source.path)));
+  } catch {
+  }
+}
+
+function pathBaseName(path: string): string {
+  return path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
+}
+
+function closeRecentDatabases(): void {
+  recentDatabaseMenu.hidden = true;
+  recentDatabaseButton.setAttribute("aria-expanded", "false");
+}
+
+function renderRecentDatabases(): void {
+  recentDatabaseMenu.replaceChildren();
+  recentDatabaseButton.disabled = busy || !engineReady || recentDatabasePaths.length === 0;
+
+  const heading = document.createElement("div");
+  heading.className = "recent-database-heading";
+  heading.textContent = "最近数据库";
+  recentDatabaseMenu.append(heading);
+
+  for (const path of recentDatabasePaths) {
+    const item = document.createElement("button");
+    item.type = "button";
+    item.className = "recent-database-item";
+    item.setAttribute("role", "menuitem");
+    item.title = path;
+    item.innerHTML = `<i data-lucide="database"></i>`;
+    const copy = document.createElement("span");
+    const name = document.createElement("strong");
+    name.textContent = pathBaseName(path);
+    const fullPath = document.createElement("small");
+    fullPath.textContent = path;
+    copy.append(name, fullPath);
+    item.append(copy);
+    item.addEventListener("click", () => {
+      if (busy || !engineReady) return;
+      closeRecentDatabases();
+      void addNativeSources([path]);
+    });
+    recentDatabaseMenu.append(item);
+  }
+  createIcons({ icons: iconSet });
+}
+
+function saveRecentDatabase(path: string): void {
+  recentDatabasePaths = [path, ...recentDatabasePaths.filter((item) => item !== path)]
+    .slice(0, MAX_RECENT_DATABASES);
+  try {
+    localStorage.setItem(RECENT_DATABASES_KEY, JSON.stringify(recentDatabasePaths));
+  } catch {
+  }
+  renderRecentDatabases();
+}
 
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
@@ -265,6 +406,9 @@ function setBusy(nextBusy: boolean, message?: string): void {
   busy = nextBusy;
   runButton.disabled = !engineReady || busy || !editor.value.trim();
   exportButton.disabled = busy || !currentResult || currentResult.columns.length === 0;
+  recentDatabaseButton.disabled = busy || !engineReady || recentDatabasePaths.length === 0;
+  databaseDirectoryButton.disabled = busy || !engineReady || !isTauriRuntime();
+  addProjectDirectoryButton.disabled = busy || !engineReady || !isTauriRuntime();
   cancelButton.hidden = !isTauriRuntime() || !queryRunning;
   if (message) setStatus(message);
   document.body.classList.toggle("busy", busy);
@@ -305,10 +449,10 @@ function renderSchema(): void {
     schemaList.append(empty);
     return;
   }
-  if (!source.metadataLoaded) {
+  if (!source.columnsLoaded && !source.metadataLoaded) {
     const empty = document.createElement("div");
     empty.className = "schema-empty";
-    empty.textContent = source.metadataLoading ? "正在加载字段" : "点击数据源加载字段和行数";
+    empty.textContent = source.metadataLoading ? "正在加载字段" : "点击数据源加载字段";
     schemaList.append(empty);
     return;
   }
@@ -336,13 +480,99 @@ function renderSchema(): void {
 
 function renderSources(): void {
   const filter = sourceSearch.value.trim().toLocaleLowerCase();
-  const visibleSources = sources.filter((source) =>
-    `${source.name} ${source.alias} ${source.path ?? ""}`.toLocaleLowerCase().includes(filter),
-  );
   query<HTMLElement>("#source-count").textContent = String(sources.length);
   sourceList.replaceChildren();
 
-  if (sources.length === 0) {
+  const projectHosts = new Map<string, HTMLDivElement>();
+  for (const directory of projectDirectories) {
+    const folders = projectFolders.filter((folder) => folder.directoryId === directory.id);
+    const directoryMatches = !filter || directory.name.toLocaleLowerCase().includes(filter)
+      || folders.some((folder) => `${folder.name} ${folder.path}`.toLocaleLowerCase().includes(filter));
+    if (!directoryMatches) continue;
+    const directoryElement = document.createElement("div");
+    directoryElement.className = "project-directory source-group";
+    const collapsed = !filter && collapsedProjectDirectories.has(directory.id);
+    const row = document.createElement("div");
+    row.className = "source-folder-row project-directory-row";
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "source-folder-toggle";
+    toggle.innerHTML = `<span class="tree-chevron"><i data-lucide="chevron-right"></i></span><span class="tree-folder-icon"><i data-lucide="${collapsed ? "folder" : "folder-open"}"></i></span>`;
+    const copy = document.createElement("span");
+    copy.className = "tree-copy";
+    const name = document.createElement("strong");
+    name.textContent = directory.name;
+    const details = document.createElement("small");
+    details.textContent = `${folders.length} 个文件夹`;
+    copy.append(name, details);
+    toggle.append(copy);
+    toggle.addEventListener("click", () => {
+      if (collapsedProjectDirectories.has(directory.id)) collapsedProjectDirectories.delete(directory.id);
+      else collapsedProjectDirectories.add(directory.id);
+      renderSources();
+    });
+    const addFolder = document.createElement("button");
+    addFolder.type = "button";
+    addFolder.className = "source-remove project-action project-add-action";
+    addFolder.title = "添加项目文件夹";
+    addFolder.setAttribute("aria-label", `向 ${directory.name} 添加项目文件夹`);
+    addFolder.innerHTML = `<i data-lucide="plus"></i>`;
+    addFolder.addEventListener("click", () => void addProjectFolder(directory.id));
+    const removeDirectory = document.createElement("button");
+    removeDirectory.type = "button";
+    removeDirectory.className = "source-remove project-action project-remove-action";
+    removeDirectory.title = "移除项目目录";
+    removeDirectory.setAttribute("aria-label", `移除项目目录 ${directory.name}`);
+    removeDirectory.innerHTML = `<i data-lucide="trash-2"></i>`;
+    removeDirectory.addEventListener("click", () => removeProjectDirectory(directory));
+    row.append(toggle, addFolder, removeDirectory);
+    directoryElement.append(row);
+    const children = document.createElement("div");
+    children.className = "source-tree-children project-directory-children";
+    children.hidden = collapsed;
+    for (const folder of folders) {
+      if (filter && !directory.name.toLocaleLowerCase().includes(filter)
+        && !`${folder.name} ${folder.path}`.toLocaleLowerCase().includes(filter)) continue;
+      const folderElement = document.createElement("div");
+      folderElement.className = "project-folder source-group";
+      const folderRow = document.createElement("div");
+      folderRow.className = "source-folder-row project-folder-row";
+      const folderToggle = document.createElement("button");
+      folderToggle.type = "button";
+      folderToggle.className = "source-folder-toggle";
+      const scanning = scanningProjectFolders.has(folder.id);
+      folderToggle.disabled = scanning;
+      folderToggle.innerHTML = `<span class="tree-chevron"><i data-lucide="chevron-right"></i></span><span class="tree-folder-icon"><i data-lucide="${scanning ? "loader-circle" : "folder-open"}"${scanning ? " class=\"spin\"" : ""}></i></span>`;
+      const folderCopy = document.createElement("span");
+      folderCopy.className = "tree-copy";
+      const folderName = document.createElement("strong");
+      folderName.textContent = folder.name;
+      const folderDetails = document.createElement("small");
+      folderDetails.textContent = scanning ? "正在扫描数据库…" : folder.path;
+      folderCopy.append(folderName, folderDetails);
+      folderToggle.append(folderCopy);
+      folderToggle.title = folder.path;
+      folderToggle.addEventListener("click", () => void scanProjectFolder(folder));
+      const removeFolder = document.createElement("button");
+      removeFolder.type = "button";
+      removeFolder.className = "source-remove project-action project-remove-action";
+      removeFolder.title = "移除项目文件夹";
+      removeFolder.setAttribute("aria-label", `移除 ${folder.name}`);
+      removeFolder.innerHTML = `<i data-lucide="trash-2"></i>`;
+      removeFolder.addEventListener("click", () => void removeProjectFolder(folder));
+      folderRow.append(folderToggle, removeFolder);
+      folderElement.append(folderRow);
+      const folderHost = document.createElement("div");
+      folderHost.className = "source-tree-children project-folder-children";
+      folderElement.append(folderHost);
+      children.append(folderElement);
+      projectHosts.set(folder.id, folderHost);
+    }
+    directoryElement.append(children);
+    sourceList.append(directoryElement);
+  }
+
+  if (sources.length === 0 && projectDirectories.length === 0) {
     const empty = document.createElement("button");
     empty.type = "button";
     empty.className = "source-empty";
@@ -354,41 +584,163 @@ function renderSources(): void {
     return;
   }
 
-  for (const source of visibleSources) {
-    const row = document.createElement("div");
-    row.className = "source-row";
-    row.classList.toggle("active", source.id === selectedSourceId);
+  const grouped = new Map<string, SourceGroup>();
+  for (const source of sources) {
+    const key = source.databaseId
+      ? `database:${source.databaseId}`
+      : source.path
+        ? `file:${source.path}`
+        : `source:${source.id}`;
+    const label = source.name.includes(" / ") ? source.name.slice(0, source.name.indexOf(" / ")) : source.name;
+    const group = grouped.get(key) ?? { key, label, sources: [] };
+    group.sources.push(source);
+    grouped.set(key, group);
+  }
+  const visibleGroups = Array.from(grouped.values()).flatMap((group) => {
+    if (!filter) return [group];
+    const groupMatches = `${group.label} ${group.sources[0]?.path ?? ""}`.toLocaleLowerCase().includes(filter);
+    const matchingSources = groupMatches
+      ? group.sources
+      : group.sources.filter((source) =>
+        `${source.name} ${source.alias} ${source.schema ?? ""} ${source.objectName ?? ""} ${source.columns.map((column) => column.name).join(" ")}`
+          .toLocaleLowerCase()
+          .includes(filter),
+      );
+    return matchingSources.length > 0 ? [{ ...group, sources: matchingSources }] : [];
+  });
 
-    const select = document.createElement("button");
-    select.type = "button";
-    select.className = "source-select";
-    select.title = source.path ?? source.name;
-    select.innerHTML = `<i data-lucide="chevron-right"></i>`;
-    const copy = document.createElement("span");
-    const name = document.createElement("strong");
-    name.textContent = source.alias;
-    const details = document.createElement("small");
-    const formatLabel = source.format === "duckdb"
-      ? `DUCKDB ${source.objectKind ?? "TABLE"}`
-      : source.format.toUpperCase();
-    const metadata = source.metadataLoaded
-      ? `${formatNumber(source.rowCount)} 行`
-      : "点击加载字段";
-    details.textContent = `${formatLabel} · ${metadata} · ${formatBytes(source.size)}`;
-    copy.append(name, details);
-    select.append(copy);
-    select.addEventListener("click", () => void selectSource(source));
+  if (visibleGroups.length === 0) {
+    const empty = document.createElement("div");
+    empty.className = "schema-empty";
+    empty.textContent = "没有匹配的数据源";
+    sourceList.append(empty);
+    renderSchema();
+    return;
+  }
+
+  for (const group of visibleGroups) {
+    const representative = group.sources[0];
+    if (!representative) continue;
+    const groupContainsSelected = group.sources.some((source) => source.id === selectedSourceId);
+    const groupCollapsed = !filter && collapsedSourceGroups.has(group.key);
+    const groupElement = document.createElement("div");
+    groupElement.className = "source-group";
+
+    const groupRow = document.createElement("div");
+    groupRow.className = "source-folder-row";
+    groupRow.classList.toggle("contains-active", groupContainsSelected);
+    groupRow.classList.toggle("open", !groupCollapsed);
+
+    const groupToggle = document.createElement("button");
+    groupToggle.type = "button";
+    groupToggle.className = "source-folder-toggle";
+    groupToggle.title = representative.path ?? group.label;
+    groupToggle.innerHTML = `<span class="tree-chevron"><i data-lucide="chevron-right"></i></span><span class="tree-folder-icon"><i data-lucide="${groupCollapsed ? "folder" : "folder-open"}"></i></span>`;
+    const groupCopy = document.createElement("span");
+    groupCopy.className = "tree-copy";
+    const groupName = document.createElement("strong");
+    groupName.textContent = group.label;
+    const groupDetails = document.createElement("small");
+    groupDetails.textContent = representative.format === "duckdb"
+      ? `DUCKDB · ${group.sources.length} 个对象 · ${formatBytes(representative.size)}`
+      : `${representative.format.toUpperCase()} · ${formatBytes(representative.size)}`;
+    groupCopy.append(groupName, groupDetails);
+    groupToggle.append(groupCopy);
+    groupToggle.addEventListener("click", () => {
+      if (collapsedSourceGroups.has(group.key)) collapsedSourceGroups.delete(group.key);
+      else collapsedSourceGroups.add(group.key);
+      renderSources();
+    });
 
     const remove = document.createElement("button");
     remove.type = "button";
     remove.className = "source-remove";
-    remove.title = "移除数据源";
-    remove.setAttribute("aria-label", `移除 ${source.alias}`);
+    remove.title = "移除数据文件";
+    remove.setAttribute("aria-label", `移除 ${group.label}`);
     remove.innerHTML = `<i data-lucide="trash-2"></i>`;
-    remove.addEventListener("click", () => void removeSource(source));
+    remove.addEventListener("click", () => void removeSource(representative));
+    groupRow.append(groupToggle, remove);
+    groupElement.append(groupRow);
 
-    row.append(select, remove);
-    sourceList.append(row);
+    const groupChildren = document.createElement("div");
+    groupChildren.className = "source-tree-children";
+    groupChildren.hidden = groupCollapsed;
+    const schemas = new Map<string, DataSource[]>();
+    for (const source of group.sources) {
+      const schemaName = source.format === "duckdb" ? (source.schema ?? "main") : "";
+      const schemaSources = schemas.get(schemaName) ?? [];
+      schemaSources.push(source);
+      schemas.set(schemaName, schemaSources);
+    }
+
+    for (const [schemaName, schemaSources] of schemas) {
+      let leafHost = groupChildren;
+      if (schemaName) {
+        const schemaKey = `${group.key}\0${schemaName}`;
+        const schemaCollapsed = !filter && collapsedSchemas.has(schemaKey);
+        const schemaElement = document.createElement("div");
+        schemaElement.className = "tree-schema";
+        const schemaToggle = document.createElement("button");
+        schemaToggle.type = "button";
+        schemaToggle.className = "tree-schema-toggle";
+        schemaToggle.classList.toggle("open", !schemaCollapsed);
+        schemaToggle.innerHTML = `<span class="tree-chevron"><i data-lucide="chevron-right"></i></span><span class="tree-folder-icon"><i data-lucide="${schemaCollapsed ? "folder" : "folder-open"}"></i></span>`;
+        const schemaCopy = document.createElement("span");
+        schemaCopy.className = "tree-copy";
+        const schemaLabel = document.createElement("strong");
+        schemaLabel.textContent = schemaName;
+        const schemaDetails = document.createElement("small");
+        schemaDetails.textContent = `${schemaSources.length} 张表/视图`;
+        schemaCopy.append(schemaLabel, schemaDetails);
+        schemaToggle.append(schemaCopy);
+        schemaToggle.addEventListener("click", () => {
+          if (collapsedSchemas.has(schemaKey)) collapsedSchemas.delete(schemaKey);
+          else collapsedSchemas.add(schemaKey);
+          renderSources();
+        });
+        const schemaChildren = document.createElement("div");
+        schemaChildren.className = "tree-schema-children";
+        schemaChildren.hidden = schemaCollapsed;
+        schemaElement.append(schemaToggle, schemaChildren);
+        groupChildren.append(schemaElement);
+        leafHost = schemaChildren;
+      }
+
+      for (const source of schemaSources) {
+        const leaf = document.createElement("button");
+        leaf.type = "button";
+        leaf.className = "source-tree-leaf";
+        leaf.classList.toggle("active", source.id === selectedSourceId);
+        leaf.title = source.sqlName;
+        leaf.innerHTML = `<span class="tree-table-icon"><i data-lucide="table-2"></i></span>`;
+        const leafCopy = document.createElement("span");
+        leafCopy.className = "tree-copy";
+        const leafName = document.createElement("strong");
+        leafName.textContent = source.objectName ?? source.alias;
+        const leafDetails = document.createElement("small");
+        const matchingColumns = filter
+          ? source.columns.filter((column) => column.name.toLocaleLowerCase().includes(filter))
+          : [];
+        const metadata = matchingColumns.length > 0
+          ? `字段 · ${matchingColumns.map((column) => column.name).join(", ")}`
+          : source.metadataLoaded
+          ? `${formatNumber(source.rowCount)} 行`
+          : source.columnsLoaded
+            ? "字段已加载 · 点击统计行数"
+            : "点击加载字段";
+        leafDetails.textContent = `${source.objectKind ?? source.format.toUpperCase()} · ${metadata}`;
+        leafCopy.append(leafName, leafDetails);
+        leaf.append(leafCopy);
+        leaf.addEventListener("click", () => void selectSource(source));
+        leafHost.append(leaf);
+      }
+    }
+
+    groupElement.append(groupChildren);
+    const projectFolderId = representative.projectFolderId;
+    if (projectFolderId && !projectHosts.has(projectFolderId)) continue;
+    const groupHost = projectFolderId ? projectHosts.get(projectFolderId)! : sourceList;
+    groupHost.append(groupElement);
   }
   createIcons({ icons: iconSet });
   renderSchema();
@@ -399,9 +751,74 @@ function cellText(value: QueryResult["rows"][number][number]): string {
   return String(value);
 }
 
+function activeColumnFilters(): string[] {
+  return columnFilters.map((filter) => filter.trim().toLocaleLowerCase());
+}
+
+function filteredResultRows(): Array<{ row: QueryResult["rows"][number]; sourceIndex: number }> {
+  if (!currentResult) return [];
+  const filters = activeColumnFilters();
+  return currentResult.rows
+    .map((row, sourceIndex) => ({ row, sourceIndex }))
+    .filter(({ row }) => filters.every((filter, index) =>
+      !filter || cellText(row[index]).toLocaleLowerCase().includes(filter),
+    ));
+}
+
+function updateResultMeta(filteredRowCount: number): void {
+  if (!currentResult) return;
+  const hasFilters = activeColumnFilters().some(Boolean);
+  const rowSummary = hasFilters
+    ? `筛选后 ${formatNumber(filteredRowCount)} / 共 ${formatNumber(currentResult.rowCount)} 行`
+    : `${formatNumber(currentResult.rowCount)} 行`;
+  const renderedRowCount = hasFilters ? filteredRowCount : currentResult.rowCount;
+  const renderedSuffix = renderedRowCount > MAX_RENDER_ROWS
+    ? ` · 屏幕显示前 ${formatNumber(MAX_RENDER_ROWS)} 行`
+    : "";
+  const truncatedSuffix = currentResult.truncated ? " · 已达到 100,000 行安全上限" : "";
+  resultMeta.textContent = `${rowSummary} · ${currentResult.columns.length} 列 · ${currentResult.elapsedMs.toFixed(0)} ms${renderedSuffix}${truncatedSuffix}`;
+}
+
+function renderResultRows(tbody: HTMLTableSectionElement): void {
+  if (!currentResult) return;
+  const filteredRows = filteredResultRows();
+  tbody.replaceChildren();
+
+  if (filteredRows.length === 0) {
+    const tr = document.createElement("tr");
+    const td = document.createElement("td");
+    td.className = "no-filter-results";
+    td.colSpan = currentResult.columns.length + 1;
+    td.textContent = "没有符合当前筛选条件的数据";
+    tr.append(td);
+    tbody.append(tr);
+    updateResultMeta(0);
+    return;
+  }
+
+  filteredRows.slice(0, MAX_RENDER_ROWS).forEach(({ row, sourceIndex }) => {
+    const tr = document.createElement("tr");
+    const rowNumber = document.createElement("th");
+    rowNumber.className = "row-number";
+    rowNumber.textContent = String(sourceIndex + 1);
+    tr.append(rowNumber);
+    row.forEach((value) => {
+      const td = document.createElement("td");
+      td.classList.toggle("null-cell", value === null);
+      const text = cellText(value);
+      td.textContent = text;
+      td.title = text;
+      tr.append(td);
+    });
+    tbody.append(tr);
+  });
+  updateResultMeta(filteredRows.length);
+}
+
 function renderResult(): void {
   resultHost.replaceChildren();
   if (!currentResult || currentResult.columns.length === 0) {
+    columnFilters = [];
     const empty = document.createElement("div");
     empty.className = "empty-state";
     empty.innerHTML = `<i data-lucide="braces"></i><strong>暂无查询结果</strong>`;
@@ -418,7 +835,15 @@ function renderResult(): void {
   const headerRow = document.createElement("tr");
   const numberHeader = document.createElement("th");
   numberHeader.className = "row-number";
-  numberHeader.textContent = "#";
+  numberHeader.append("#");
+  const clearFiltersButton = document.createElement("button");
+  clearFiltersButton.type = "button";
+  clearFiltersButton.className = "filter-clear";
+  clearFiltersButton.title = "清除全部筛选";
+  clearFiltersButton.setAttribute("aria-label", "清除全部筛选");
+  clearFiltersButton.innerHTML = `<i data-lucide="x"></i>`;
+  clearFiltersButton.hidden = !activeColumnFilters().some(Boolean);
+  numberHeader.append(clearFiltersButton);
   headerRow.append(numberHeader);
   currentResult.columns.forEach((column, index) => {
     const th = document.createElement("th");
@@ -427,38 +852,39 @@ function renderResult(): void {
     const type = document.createElement("span");
     type.textContent = currentResult!.columnTypes[index] ?? "";
     th.title = `${column} · ${type.textContent}`;
-    th.append(name, type);
+    const filter = document.createElement("input");
+    filter.type = "search";
+    filter.className = "column-filter";
+    filter.value = columnFilters[index] ?? "";
+    filter.placeholder = "筛选";
+    filter.autocomplete = "off";
+    filter.setAttribute("aria-label", `筛选列 ${column}`);
+    th.append(name, type, filter);
     headerRow.append(th);
   });
   thead.append(headerRow);
   table.append(thead);
 
   const tbody = document.createElement("tbody");
-  const displayedRows = currentResult.rows.slice(0, MAX_RENDER_ROWS);
-  displayedRows.forEach((row, rowIndex) => {
-    const tr = document.createElement("tr");
-    const rowNumber = document.createElement("th");
-    rowNumber.className = "row-number";
-    rowNumber.textContent = String(rowIndex + 1);
-    tr.append(rowNumber);
-    row.forEach((value) => {
-      const td = document.createElement("td");
-      td.classList.toggle("null-cell", value === null);
-      const text = cellText(value);
-      td.textContent = text;
-      td.title = text;
-      tr.append(td);
+  for (const [index, filter] of Array.from(thead.querySelectorAll<HTMLInputElement>(".column-filter")).entries()) {
+    filter.addEventListener("input", () => {
+      columnFilters[index] = filter.value;
+      clearFiltersButton.hidden = !activeColumnFilters().some(Boolean);
+      renderResultRows(tbody);
     });
-    tbody.append(tr);
+  }
+  clearFiltersButton.addEventListener("click", () => {
+    columnFilters = currentResult!.columns.map(() => "");
+    thead.querySelectorAll<HTMLInputElement>(".column-filter").forEach((filter) => {
+      filter.value = "";
+    });
+    clearFiltersButton.hidden = true;
+    renderResultRows(tbody);
   });
   table.append(tbody);
   resultHost.append(table);
-
-  const renderedSuffix = currentResult.rowCount > MAX_RENDER_ROWS
-    ? ` · 屏幕显示前 ${formatNumber(MAX_RENDER_ROWS)} 行`
-    : "";
-  const truncatedSuffix = currentResult.truncated ? " · 已达到 100,000 行安全上限" : "";
-  resultMeta.textContent = `${formatNumber(currentResult.rowCount)} 行 · ${currentResult.columns.length} 列 · ${currentResult.elapsedMs.toFixed(0)} ms${renderedSuffix}${truncatedSuffix}`;
+  renderResultRows(tbody);
+  createIcons({ icons: iconSet });
   exportButton.disabled = busy;
 }
 
@@ -494,6 +920,7 @@ async function loadSourceMetadata(source: DataSource): Promise<void> {
       : await describeDuckDBObject(source.databaseAlias!, source.schema, source.objectName);
     source.columns = metadata.columns;
     source.rowCount = metadata.rowCount;
+    source.columnsLoaded = true;
     source.metadataLoaded = true;
   } catch (error) {
     showToast(error instanceof Error ? error.message : "读取字段失败", "error");
@@ -515,7 +942,7 @@ async function selectSource(source: DataSource): Promise<void> {
   await loadSourceMetadata(source);
 }
 
-async function addNativeSources(paths: string[]): Promise<void> {
+async function addNativeSources(paths: string[], projectFolderId?: string): Promise<void> {
   if (!engineReady || paths.length === 0) return;
   setBusy(true, `正在枚举 ${paths.length} 个数据文件`);
   let added = 0;
@@ -530,8 +957,9 @@ async function addNativeSources(paths: string[]): Promise<void> {
       const alias = sourceAlias(info.name, ["main", "temp"]);
       setStatus(`正在枚举 ${index + 1}/${paths.length}：${info.name}`);
       const objects = await listNativeObjects({ path: info.path, alias, format });
+      if (format === "duckdb") saveRecentDatabase(info.path);
       const databaseId = format === "duckdb" ? crypto.randomUUID() : undefined;
-      const databaseSources = objects.map((object) => ({
+      const databaseSources: DataSource[] = objects.map((object) => ({
         id: crypto.randomUUID(),
         name: `${info.name} / ${object.schema}.${object.name}`,
         path: info.path,
@@ -542,6 +970,7 @@ async function addNativeSources(paths: string[]): Promise<void> {
         size: info.size,
         rowCount: 0,
         columns: [],
+        columnsLoaded: false,
         metadataLoaded: false,
         native: true,
         databaseId,
@@ -549,8 +978,20 @@ async function addNativeSources(paths: string[]): Promise<void> {
         schema: object.schema,
         objectName: object.name,
         objectKind: object.kind,
-      } satisfies DataSource));
+        projectFolderId,
+      }));
+      if (format === "duckdb") {
+        const columnGroups = await listNativeObjectColumns({ path: info.path, alias, format });
+        for (const source of databaseSources) {
+          const group = columnGroups.find((item) =>
+            item.schema === source.schema && item.name === source.objectName,
+          );
+          source.columns = group?.columns ?? [];
+          source.columnsLoaded = Boolean(group);
+        }
+      }
       sources.push(...databaseSources);
+      if (projectFolderId && databaseId) collapsedSourceGroups.add(`database:${databaseId}`);
       selectedSourceId = databaseSources[0]?.id ?? selectedSourceId;
       added += databaseSources.length;
     } catch (error) {
@@ -563,6 +1004,7 @@ async function addNativeSources(paths: string[]): Promise<void> {
     showToast(`已枚举 ${added} 个数据源对象`);
   }
   renderSources();
+  saveSources();
   setBusy(false, added > 0 ? `已加载 ${sources.length} 个数据源对象` : "未加载数据源");
   editor.focus();
 }
@@ -587,7 +1029,7 @@ async function addSources(pendingSources: PendingSource[]): Promise<void> {
         const databaseId = id;
         const databaseAlias = sourceAlias(pending.name, ["main", "temp"]);
         const objects = await registerDuckDBSource(virtualName, databaseAlias, pending.data);
-        const databaseSources = objects.map((object) => ({
+        const databaseSources: DataSource[] = objects.map((object) => ({
           id: crypto.randomUUID(),
           name: `${pending.name} / ${object.schema}.${object.name}`,
           path: pending.path,
@@ -597,14 +1039,15 @@ async function addSources(pendingSources: PendingSource[]): Promise<void> {
           format,
           size: pending.size,
           rowCount: 0,
-          columns: [],
+          columns: object.columns,
+          columnsLoaded: true,
           metadataLoaded: false,
           databaseId,
           databaseAlias,
           schema: object.schema,
           objectName: object.name,
           objectKind: object.kind,
-        } satisfies DataSource));
+        }));
         sources.push(...databaseSources);
         selectedSourceId = databaseSources[0]?.id ?? null;
         added += databaseSources.length;
@@ -621,6 +1064,7 @@ async function addSources(pendingSources: PendingSource[]): Promise<void> {
           size: pending.size,
           rowCount: 0,
           columns: [],
+          columnsLoaded: true,
           metadataLoaded: true,
         };
         const metadata = await registerSource(source, pending.data);
@@ -660,6 +1104,113 @@ async function openSources(): Promise<void> {
   }
 }
 
+async function openDatabaseDirectory(): Promise<void> {
+  if (busy || !engineReady || !isTauriRuntime()) return;
+  try {
+    const directory = await chooseDatabaseDirectory();
+    if (!directory) return;
+    setBusy(true, "正在扫描数据库目录");
+    const paths = await listDatabaseFiles(directory);
+    if (paths.length === 0) {
+      setBusy(false, "目录中没有数据库文件");
+      showToast("目录及其子目录中没有 .duckdb、.db 或 .ddb 文件", "error");
+      return;
+    }
+    await addNativeSources(paths);
+  } catch (error) {
+    setBusy(false, "扫描数据库目录失败");
+    showToast(error instanceof Error ? error.message : "扫描数据库目录失败", "error");
+  }
+}
+
+async function scanProjectFolder(folder: ProjectFolder): Promise<void> {
+  if (busy || !engineReady) return;
+  scanningProjectFolders.add(folder.id);
+  renderSources();
+  try {
+    setBusy(true, `正在扫描项目文件夹：${folder.name}`);
+    const paths = await listDatabaseFiles(folder.path);
+    const pathSet = new Set(paths);
+    sources = sources.filter((source) => !(source.projectFolderId === folder.id && source.path && pathSet.has(source.path)));
+    if (paths.length > 0) await addNativeSources(paths, folder.id);
+    else {
+      renderSources();
+      setBusy(false, `项目文件夹 ${folder.name} 中没有数据库`);
+      showToast(`“${folder.name}”中没有 .duckdb、.db 或 .ddb 文件`, "error");
+    }
+  } catch (error) {
+    setBusy(false, "扫描项目文件夹失败");
+    showToast(error instanceof Error ? error.message : "扫描项目文件夹失败", "error");
+  } finally {
+    scanningProjectFolders.delete(folder.id);
+    renderSources();
+  }
+}
+
+async function addProjectFolder(directoryId: string): Promise<void> {
+  const directory = projectDirectories.find((item) => item.id === directoryId);
+  if (!directory) return;
+  const requestedPath = window.prompt(`向“${directory.name}”添加项目文件夹\n请输入文件夹路径：`, "");
+  if (requestedPath === null) return;
+  const path = requestedPath.trim();
+  if (!path) return;
+  const existing = projectFolders.find((folder) => folder.directoryId === directoryId && folder.path.toLocaleLowerCase() === path.toLocaleLowerCase());
+  if (existing) {
+    await scanProjectFolder(existing);
+    return;
+  }
+  const name = path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
+  const folder: ProjectFolder = { id: crypto.randomUUID(), directoryId, name, path };
+  projectFolders = [...projectFolders, folder];
+  saveProjectState();
+  renderSources();
+  await scanProjectFolder(folder);
+}
+
+async function removeProjectFolder(folder: ProjectFolder): Promise<void> {
+  if (busy) return;
+  projectFolders = projectFolders.filter((item) => item.id !== folder.id);
+  sources = sources.filter((source) => source.projectFolderId !== folder.id);
+  saveSources();
+  saveProjectState();
+  if (selectedSourceId && !sources.some((source) => source.id === selectedSourceId)) {
+    selectedSourceId = sources.at(-1)?.id ?? null;
+  }
+  renderSources();
+  setBusy(false, `已移除项目文件夹：${folder.name}`);
+}
+
+function removeProjectDirectory(directory: ProjectDirectory): void {
+  if (busy) return;
+  if (!window.confirm(`移除项目目录“${directory.name}”？其中的数据库不会被删除。`)) return;
+  const folderIds = new Set(projectFolders.filter((folder) => folder.directoryId === directory.id).map((folder) => folder.id));
+  projectDirectories = projectDirectories.filter((item) => item.id !== directory.id);
+  projectFolders = projectFolders.filter((folder) => folder.directoryId !== directory.id);
+  sources = sources.filter((source) => !source.projectFolderId || !folderIds.has(source.projectFolderId));
+  saveSources();
+  if (selectedSourceId && !sources.some((source) => source.id === selectedSourceId)) {
+    selectedSourceId = sources.at(-1)?.id ?? null;
+  }
+  saveProjectState();
+  renderSources();
+  setBusy(false, `已移除项目目录：${directory.name}`);
+}
+
+async function addProjectDirectory(): Promise<void> {
+  const requestedName = window.prompt("新建项目目录\n请输入目录名称：", "新项目");
+  if (requestedName === null) return;
+  const name = requestedName.trim();
+  if (!name) return;
+  if (projectDirectories.some((item) => item.name.toLocaleLowerCase() === name.toLocaleLowerCase())) {
+    showToast("项目目录名称已存在", "error");
+    return;
+  }
+  projectDirectories = [...projectDirectories, { id: crypto.randomUUID(), name }];
+  saveProjectState();
+  renderSources();
+  showToast(`已创建项目目录：${name}`);
+}
+
 async function removeSource(source: DataSource): Promise<void> {
   if (busy) return;
   setBusy(true, `正在移除 ${source.alias}`);
@@ -674,6 +1225,7 @@ async function removeSource(source: DataSource): Promise<void> {
         : [source.id],
     );
     sources = sources.filter((item) => !removedIds.has(item.id));
+    saveSources();
     if (removedSelected) {
       selectedSourceId = sources.at(-1)?.id ?? null;
       const next = selectedSource();
@@ -705,6 +1257,7 @@ async function runQuery(): Promise<void> {
   cancelRequested = false;
   try {
     currentResult = isTauriRuntime() ? await executeNativeSql(sql, nativeQuerySources()) : await executeSql(sql);
+    columnFilters = currentResult.columns.map(() => "");
     saveHistory(sql);
     renderResult();
     queryRunning = false;
@@ -747,6 +1300,23 @@ function browserFiles(files: FileList | File[]): Promise<PendingSource[]> {
 }
 
 query<HTMLButtonElement>("#add-source").addEventListener("click", () => void openSources());
+query<HTMLButtonElement>("#open-database-directory").addEventListener("click", () => void openDatabaseDirectory());
+addProjectDirectoryButton.addEventListener("click", () => void addProjectDirectory());
+recentDatabaseButton.addEventListener("click", () => {
+  if (recentDatabaseButton.disabled) return;
+  const opening = recentDatabaseMenu.hidden;
+  recentDatabaseMenu.hidden = !opening;
+  recentDatabaseButton.setAttribute("aria-expanded", String(opening));
+});
+document.addEventListener("click", (event) => {
+  if (!recentDatabaseMenu.hidden && !event.composedPath().includes(recentDatabases)) closeRecentDatabases();
+});
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && !recentDatabaseMenu.hidden) {
+    closeRecentDatabases();
+    recentDatabaseButton.focus();
+  }
+});
 runButton.addEventListener("click", () => void runQuery());
 exportButton.addEventListener("click", () => void exportResult());
 cancelButton.addEventListener("click", async () => {
@@ -818,6 +1388,7 @@ async function initializeDropHandling(): Promise<void> {
 
 async function start(): Promise<void> {
   renderHistory();
+  renderRecentDatabases();
   renderSources();
   setBusy(false, "正在初始化 DuckDB");
   try {
@@ -828,7 +1399,16 @@ async function start(): Promise<void> {
     engineState.innerHTML = `<i data-lucide="circle-check"></i><span>${isTauriRuntime() ? "原生 DuckDB 就绪" : "DuckDB-WASM 就绪"}</span>`;
     createIcons({ icons: iconSet });
     setBusy(false, "DuckDB 已就绪");
+    const firstSource = selectedSource() ?? sources.at(0) ?? null;
+    if (firstSource) {
+      selectedSourceId = firstSource.id;
+      editor.value = defaultQuery(firstSource.sqlName);
+      renderSources();
+    }
     editor.focus();
+    if (isTauriRuntime() && projectFolders.length > 0 && sources.length === 0) {
+      for (const folder of projectFolders) await scanProjectFolder(folder);
+    }
   } catch (error) {
     engineState.classList.add("failed");
     engineState.innerHTML = `<i data-lucide="circle-alert"></i><span>DuckDB 初始化失败</span>`;

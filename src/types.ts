@@ -24,6 +24,7 @@ export interface DataSource {
   size: number;
   rowCount: number;
   columns: SourceColumn[];
+  columnsLoaded?: boolean;
   metadataLoaded?: boolean;
   metadataLoading?: boolean;
   native?: boolean;
@@ -32,6 +33,7 @@ export interface DataSource {
   databaseId?: string;
   databaseAlias?: string;
   objectKind?: "TABLE" | "VIEW" | "FILE";
+  projectFolderId?: string;
 }
 
 export type CellValue = string | number | boolean | null;

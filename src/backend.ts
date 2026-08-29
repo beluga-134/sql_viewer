@@ -16,6 +16,13 @@ export type NativeObject = {
   sqlName: string;
 };
 
+export type NativeObjectColumns = {
+  databaseAlias?: string;
+  schema: string;
+  name: string;
+  columns: SourceColumn[];
+};
+
 export type NativeMetadata = {
   columns: SourceColumn[];
   rowCount: number;
@@ -43,12 +50,30 @@ export async function chooseSourcePaths(): Promise<string[]> {
   return Array.isArray(selected) ? selected : [selected];
 }
 
+export async function chooseDatabaseDirectory(): Promise<string | null> {
+  if (!isTauriRuntime()) return null;
+  const { open } = await import("@tauri-apps/plugin-dialog");
+  const selected = await open({
+    multiple: false,
+    directory: true,
+  });
+  return typeof selected === "string" ? selected : null;
+}
+
+export async function listDatabaseFiles(path: string): Promise<string[]> {
+  return invoke<string[]>("list_database_files", { path });
+}
+
 export async function getLocalFileInfo(path: string): Promise<LocalFilePayload> {
   return invoke<LocalFilePayload>("get_local_file_info", { path });
 }
 
 export async function listNativeObjects(source: NativeSourceSpec): Promise<NativeObject[]> {
   return invoke<NativeObject[]>("list_native_objects", { source });
+}
+
+export async function listNativeObjectColumns(source: NativeSourceSpec): Promise<NativeObjectColumns[]> {
+  return invoke<NativeObjectColumns[]>("list_native_object_columns", { source });
 }
 
 export async function describeNativeObject(

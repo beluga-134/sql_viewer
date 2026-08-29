@@ -188,6 +188,7 @@ export type DuckDBObjectMetadata = {
   name: string;
   kind: "TABLE" | "VIEW";
   sqlName: string;
+  columns: SourceColumn[];
 };
 
 export async function describeDuckDBObject(
@@ -238,9 +239,25 @@ export async function registerDuckDBSource(
       ...tables.rows.map((row) => ({ schema: String(row[0]), name: String(row[1]), kind: "TABLE" as const })),
       ...views.rows.map((row) => ({ schema: String(row[0]), name: String(row[1]), kind: "VIEW" as const })),
     ];
+    const columnRows = tableToRows(
+      await connection.query(
+        `SELECT table_schema, table_name, column_name, data_type, is_nullable ` +
+          `FROM information_schema.columns ` +
+          `WHERE table_catalog = ${quoteString(databaseAlias)} ` +
+          `AND table_schema NOT IN ('information_schema', 'pg_catalog') ` +
+          `ORDER BY table_schema, table_name, ordinal_position`,
+      ),
+    ).rows;
     const metadata = objects.map((object) => ({
       ...object,
       sqlName: `${database}.${quoteIdentifier(object.schema)}.${quoteIdentifier(object.name)}`,
+      columns: columnRows
+        .filter((row) => String(row[0]) === object.schema && String(row[1]) === object.name)
+        .map((row) => ({
+          name: String(row[2] ?? ""),
+          type: String(row[3] ?? "UNKNOWN"),
+          nullable: String(row[4] ?? "YES"),
+        })),
     }));
     if (metadata.length === 0) {
       throw new Error("DuckDB 文件中没有可显示的表或视图");

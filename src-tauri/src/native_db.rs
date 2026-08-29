@@ -50,6 +50,15 @@ pub struct NativeObject {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct NativeObjectColumns {
+    pub database_alias: Option<String>,
+    pub schema: String,
+    pub name: String,
+    pub columns: Vec<NativeColumn>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct NativeMetadata {
     pub columns: Vec<NativeColumn>,
     pub row_count: usize,
@@ -261,7 +270,7 @@ pub fn list_native_objects(source: NativeSourceSpec) -> Result<Vec<NativeObject>
     Ok(objects)
 }
 
-fn describe_relation(connection: &Connection, relation: &str) -> Result<NativeMetadata, String> {
+fn describe_columns(connection: &Connection, relation: &str) -> Result<Vec<NativeColumn>, String> {
     let mut statement = connection
         .prepare(&format!("DESCRIBE SELECT * FROM {relation}"))
         .map_err(|error| format!("读取字段失败：{error}"))?;
@@ -274,9 +283,12 @@ fn describe_relation(connection: &Connection, relation: &str) -> Result<NativeMe
             })
         })
         .map_err(|error| format!("读取字段失败：{error}"))?;
-    let columns = rows
-        .collect::<duckdb::Result<Vec<_>>>()
-        .map_err(|error| format!("读取字段失败：{error}"))?;
+    rows.collect::<duckdb::Result<Vec<_>>>()
+        .map_err(|error| format!("读取字段失败：{error}"))
+}
+
+fn describe_relation(connection: &Connection, relation: &str) -> Result<NativeMetadata, String> {
+    let columns = describe_columns(connection, relation)?;
     let row_count: i64 = connection
         .query_row(&format!("SELECT count(*) FROM {relation}"), [], |row| {
             row.get(0)
@@ -286,6 +298,74 @@ fn describe_relation(connection: &Connection, relation: &str) -> Result<NativeMe
         columns,
         row_count: row_count.max(0) as usize,
     })
+}
+
+fn list_attached_columns(
+    connection: &Connection,
+    database_alias: &str,
+) -> Result<Vec<NativeObjectColumns>, String> {
+    let mut statement = connection
+        .prepare(&format!(
+            "SELECT table_schema, table_name, column_name, data_type, is_nullable FROM information_schema.columns WHERE table_catalog = {} AND table_schema NOT IN ('information_schema', 'pg_catalog') ORDER BY table_schema, table_name, ordinal_position",
+            quote_string(database_alias),
+        ))
+        .map_err(|error| format!("读取字段失败：{error}"))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                NativeColumn {
+                    name: row.get(2)?,
+                    type_name: row.get(3)?,
+                    nullable: row.get(4)?,
+                },
+            ))
+        })
+        .map_err(|error| format!("读取字段失败：{error}"))?;
+    let mut grouped: Vec<NativeObjectColumns> = Vec::new();
+    for row in rows {
+        let (schema, name, column) = row.map_err(|error| format!("读取字段失败：{error}"))?;
+        if let Some(object) = grouped
+            .iter_mut()
+            .find(|item| item.schema == schema && item.name == name)
+        {
+            object.columns.push(column);
+        } else {
+            grouped.push(NativeObjectColumns {
+                database_alias: Some(database_alias.to_owned()),
+                schema,
+                name,
+                columns: vec![column],
+            });
+        }
+    }
+    Ok(grouped)
+}
+
+#[tauri::command(async)]
+pub fn list_native_object_columns(
+    source: NativeSourceSpec,
+) -> Result<Vec<NativeObjectColumns>, String> {
+    let connection = configured_connection()?;
+    let path = source_path(&source)?;
+    if source.format == "duckdb" {
+        attach_database(&connection, &source, &path)?;
+        return list_attached_columns(&connection, &source.alias);
+    }
+    let reader = file_reader(&source, &path)?;
+    let relation = quote_identifier(&source.alias);
+    connection
+        .execute_batch(&format!(
+            "CREATE OR REPLACE VIEW {relation} AS SELECT * FROM {reader}"
+        ))
+        .map_err(|error| format!("无法注册数据文件：{error}"))?;
+    Ok(vec![NativeObjectColumns {
+        database_alias: None,
+        schema: "main".into(),
+        name: source.alias.clone(),
+        columns: describe_columns(&connection, &relation)?,
+    }])
 }
 
 #[tauri::command(async)]
@@ -559,6 +639,14 @@ mod tests {
         assert!(objects
             .iter()
             .any(|object| object.name == "order_summary" && object.kind == "VIEW"));
+
+        let columns = list_native_object_columns(source.clone()).unwrap();
+        let orders_columns = columns
+            .iter()
+            .find(|object| object.name == "orders")
+            .expect("orders columns");
+        assert_eq!(orders_columns.columns.len(), 3);
+        assert_eq!(orders_columns.columns[0].name, "id");
 
         let metadata = describe_native_object(NativeObjectSpec {
             path: source.path.clone(),
