@@ -272,7 +272,7 @@ sources = readStoredList<DataSource>(SOURCES_KEY)
   .filter((item) => item && item.native === true && typeof item.id === "string" && typeof item.path === "string" && typeof item.sqlName === "string")
   .filter((item) => !item.projectFolderId || projectFolders.some((folder) => folder.id === item.projectFolderId));
 for (const source of sources) {
-  if (source.projectFolderId && source.databaseId) collapsedSourceGroups.add(`database:${source.databaseId}`);
+  if (source.databaseId) collapsedSourceGroups.add(`database:${source.databaseId}`);
 }
 
 function saveProjectState(): void {
@@ -991,7 +991,7 @@ async function addNativeSources(paths: string[], projectFolderId?: string): Prom
         }
       }
       sources.push(...databaseSources);
-      if (projectFolderId && databaseId) collapsedSourceGroups.add(`database:${databaseId}`);
+      if (databaseId) collapsedSourceGroups.add(`database:${databaseId}`);
       selectedSourceId = databaseSources[0]?.id ?? selectedSourceId;
       added += databaseSources.length;
     } catch (error) {
