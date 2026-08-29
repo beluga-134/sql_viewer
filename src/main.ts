@@ -213,6 +213,7 @@ let toastTimer = 0;
 let cancelRequested = false;
 let columnFilters: string[] = [];
 const collapsedSourceGroups = new Set<string>();
+const initializedSourceGroups = new Set<string>();
 const collapsedSchemas = new Set<string>();
 const collapsedProjectDirectories = new Set<string>();
 const scanningProjectFolders = new Set<string>();
@@ -272,7 +273,10 @@ sources = readStoredList<DataSource>(SOURCES_KEY)
   .filter((item) => item && item.native === true && typeof item.id === "string" && typeof item.path === "string" && typeof item.sqlName === "string")
   .filter((item) => !item.projectFolderId || projectFolders.some((folder) => folder.id === item.projectFolderId));
 for (const source of sources) {
-  if (source.databaseId) collapsedSourceGroups.add(`database:${source.databaseId}`);
+  if (source.databaseId) {
+    collapsedSourceGroups.add(`database:${source.databaseId}`);
+    initializedSourceGroups.add(`database:${source.databaseId}`);
+  }
 }
 
 function saveProjectState(): void {
@@ -621,6 +625,10 @@ function renderSources(): void {
   for (const group of visibleGroups) {
     const representative = group.sources[0];
     if (!representative) continue;
+    if (!filter && !initializedSourceGroups.has(group.key)) {
+      if (group.sources.some((source) => source.format === "duckdb")) collapsedSourceGroups.add(group.key);
+      initializedSourceGroups.add(group.key);
+    }
     const groupContainsSelected = group.sources.some((source) => source.id === selectedSourceId);
     const groupCollapsed = !filter && collapsedSourceGroups.has(group.key);
     const groupElement = document.createElement("div");
