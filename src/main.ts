@@ -618,7 +618,9 @@ function renderSources(): void {
     const representative = group.sources[0];
     if (!representative) continue;
     const groupContainsSelected = group.sources.some((source) => source.id === selectedSourceId);
-    const isDatabaseGroup = group.sources.some((source) => source.format === "duckdb");
+    const isDatabaseGroup = group.sources.some((source) =>
+      Boolean(source.databaseId) || String(source.format).toLocaleLowerCase() === "duckdb",
+    );
     const groupCollapsed = !filter && isDatabaseGroup && !expandedSourceGroups.has(group.key);
     const groupElement = document.createElement("div");
     groupElement.className = "source-group";
@@ -662,6 +664,7 @@ function renderSources(): void {
     const groupChildren = document.createElement("div");
     groupChildren.className = "source-tree-children";
     groupChildren.hidden = groupCollapsed;
+    groupChildren.style.display = groupCollapsed ? "none" : "";
     const schemas = new Map<string, DataSource[]>();
     for (const source of group.sources) {
       const schemaName = source.format === "duckdb" ? (source.schema ?? "main") : "";
