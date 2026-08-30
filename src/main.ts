@@ -213,7 +213,7 @@ let toastTimer = 0;
 let cancelRequested = false;
 let columnFilters: string[] = [];
 const expandedSourceGroups = new Set<string>();
-const collapsedSchemas = new Set<string>();
+const expandedSchemas = new Set<string>();
 const collapsedProjectDirectories = new Set<string>();
 const scanningProjectFolders = new Set<string>();
 
@@ -677,7 +677,7 @@ function renderSources(): void {
       let leafHost = groupChildren;
       if (schemaName) {
         const schemaKey = `${group.key}\0${schemaName}`;
-        const schemaCollapsed = !filter && collapsedSchemas.has(schemaKey);
+        const schemaCollapsed = !filter && !expandedSchemas.has(schemaKey);
         const schemaElement = document.createElement("div");
         schemaElement.className = "tree-schema";
         const schemaToggle = document.createElement("button");
@@ -694,8 +694,8 @@ function renderSources(): void {
         schemaCopy.append(schemaLabel, schemaDetails);
         schemaToggle.append(schemaCopy);
         schemaToggle.addEventListener("click", () => {
-          if (collapsedSchemas.has(schemaKey)) collapsedSchemas.delete(schemaKey);
-          else collapsedSchemas.add(schemaKey);
+          if (expandedSchemas.has(schemaKey)) expandedSchemas.delete(schemaKey);
+          else expandedSchemas.add(schemaKey);
           renderSources();
         });
         const schemaChildren = document.createElement("div");
