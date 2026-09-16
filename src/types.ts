@@ -11,6 +11,7 @@ export interface SourceColumn {
   name: string;
   type: string;
   nullable: string;
+  comment?: string | null;
 }
 
 export interface DataSource {
@@ -41,6 +42,7 @@ export type CellValue = string | number | boolean | null;
 export interface QueryResult {
   columns: string[];
   columnTypes: string[];
+  columnComments?: Array<string | null>;
   rows: CellValue[][];
   rowCount: number;
   elapsedMs: number;

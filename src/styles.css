@@ -692,6 +692,10 @@ svg {
   cursor: pointer;
 }
 
+.schema-row:has(.schema-column-copy small) {
+  min-height: 42px;
+}
+
 .schema-row:hover {
   background: #e8ebed;
 }
@@ -703,9 +707,24 @@ svg {
   white-space: nowrap;
 }
 
-.schema-row span {
+.schema-column-copy {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  gap: 2px;
+}
+
+.schema-column-copy > span {
   font-family: Consolas, "Cascadia Mono", monospace;
   font-size: 11px;
+}
+
+.schema-column-copy small {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 9px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .schema-row em {
@@ -953,6 +972,10 @@ svg {
   box-shadow: 0 1px 0 #fff inset;
 }
 
+.result-table.has-column-comments thead th {
+  height: 82px;
+}
+
 .result-table thead th strong,
 .result-table thead th span {
   display: block;
@@ -966,10 +989,18 @@ svg {
   font-weight: 600;
 }
 
-.result-table thead th span {
+.result-table thead th .column-type {
   margin-top: 2px;
   color: #7a858e;
   font-size: 8px;
+  font-weight: 400;
+}
+
+.result-table thead th .column-comment {
+  margin-top: 2px;
+  color: #4f665d;
+  font-family: "Microsoft YaHei UI", sans-serif;
+  font-size: 9px;
   font-weight: 400;
 }
 

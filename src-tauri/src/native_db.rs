@@ -71,6 +71,8 @@ pub struct NativeColumn {
     #[serde(rename = "type")]
     pub type_name: String,
     pub nullable: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -280,6 +282,7 @@ fn describe_columns(connection: &Connection, relation: &str) -> Result<Vec<Nativ
                 name: row.get(0)?,
                 type_name: row.get(1)?,
                 nullable: row.get(2)?,
+                comment: None,
             })
         })
         .map_err(|error| format!("读取字段失败：{error}"))?;
@@ -306,7 +309,7 @@ fn list_attached_columns(
 ) -> Result<Vec<NativeObjectColumns>, String> {
     let mut statement = connection
         .prepare(&format!(
-            "SELECT table_schema, table_name, column_name, data_type, is_nullable FROM information_schema.columns WHERE table_catalog = {} AND table_schema NOT IN ('information_schema', 'pg_catalog') ORDER BY table_schema, table_name, ordinal_position",
+            "SELECT schema_name, table_name, column_name, data_type, CASE WHEN is_nullable THEN 'YES' ELSE 'NO' END, comment FROM duckdb_columns() WHERE database_name = {} AND schema_name NOT IN ('information_schema', 'pg_catalog') ORDER BY schema_name, table_name, column_index",
             quote_string(database_alias),
         ))
         .map_err(|error| format!("读取字段失败：{error}"))?;
@@ -319,6 +322,7 @@ fn list_attached_columns(
                     name: row.get(2)?,
                     type_name: row.get(3)?,
                     nullable: row.get(4)?,
+                    comment: row.get(5)?,
                 },
             ))
         })
@@ -377,7 +381,24 @@ pub fn describe_native_object(source: NativeObjectSpec) -> Result<NativeMetadata
         format: source.format.clone(),
     };
     let _ = prepare_source(&connection, &basic_source)?;
-    describe_relation(&connection, &relation_for_object(&source))
+    let relation = relation_for_object(&source);
+    if source.format != "duckdb" {
+        return describe_relation(&connection, &relation);
+    }
+    let columns = list_attached_columns(&connection, &source.alias)?
+        .into_iter()
+        .find(|object| object.schema == source.schema && object.name == source.object_name)
+        .map(|object| object.columns)
+        .unwrap_or_default();
+    let row_count: i64 = connection
+        .query_row(&format!("SELECT count(*) FROM {relation}"), [], |row| {
+            row.get(0)
+        })
+        .map_err(|error| format!("统计行数失败：{error}"))?;
+    Ok(NativeMetadata {
+        columns,
+        row_count: row_count.max(0) as usize,
+    })
 }
 
 fn date_text(days: i32) -> String {
@@ -620,6 +641,7 @@ mod tests {
         database
             .execute_batch(
                 "CREATE TABLE orders(id INTEGER, amount DECIMAL(10, 2), created_at DATE);\
+                 COMMENT ON COLUMN orders.amount IS '订单含税金额';\
                  INSERT INTO orders VALUES (1, 12.50, DATE '2026-08-16'), (2, 30.00, DATE '2026-08-17');\
                  CREATE VIEW order_summary AS SELECT sum(amount) AS total FROM orders;",
             )
@@ -647,6 +669,10 @@ mod tests {
             .expect("orders columns");
         assert_eq!(orders_columns.columns.len(), 3);
         assert_eq!(orders_columns.columns[0].name, "id");
+        assert_eq!(
+            orders_columns.columns[1].comment.as_deref(),
+            Some("订单含税金额")
+        );
 
         let metadata = describe_native_object(NativeObjectSpec {
             path: source.path.clone(),
@@ -658,6 +684,7 @@ mod tests {
         .unwrap();
         assert_eq!(metadata.row_count, 2);
         assert_eq!(metadata.columns.len(), 3);
+        assert_eq!(metadata.columns[1].comment.as_deref(), Some("订单含税金额"));
 
         let connection = configured_connection().unwrap();
         prepare_source(&connection, &source).unwrap();

@@ -198,15 +198,36 @@ export async function describeDuckDBObject(
 ): Promise<{ columns: SourceColumn[]; rowCount: number }> {
   const { connection } = requireEngine();
   const relation = `${quoteIdentifier(databaseAlias)}.${quoteIdentifier(schemaName)}.${quoteIdentifier(objectName)}`;
-  const columns = tableToRows(
-    await connection.query(`DESCRIBE SELECT * FROM ${relation}`),
+  const columns = await readDuckDBColumns(connection, databaseAlias, schemaName, objectName);
+  const count = tableToRows(await connection.query(`SELECT count(*) FROM ${relation}`));
+  return { columns, rowCount: Number(count.rows[0]?.[0] ?? 0) };
+}
+
+async function readDuckDBColumns(
+  connection: duckdb.AsyncDuckDBConnection,
+  databaseAlias: string,
+  schemaName?: string,
+  objectName?: string,
+): Promise<SourceColumn[]> {
+  const predicates = [
+    `database_name = ${quoteString(databaseAlias)}`,
+    `schema_name NOT IN ('information_schema', 'pg_catalog')`,
+  ];
+  if (schemaName !== undefined) predicates.push(`schema_name = ${quoteString(schemaName)}`);
+  if (objectName !== undefined) predicates.push(`table_name = ${quoteString(objectName)}`);
+  return tableToRows(
+    await connection.query(
+      `SELECT column_name, data_type, ` +
+        `CASE WHEN is_nullable THEN 'YES' ELSE 'NO' END, comment ` +
+        `FROM duckdb_columns() WHERE ${predicates.join(" AND ")} ` +
+        `ORDER BY schema_name, table_name, column_index`,
+    ),
   ).rows.map((row) => ({
     name: String(row[0] ?? ""),
     type: String(row[1] ?? "UNKNOWN"),
     nullable: String(row[2] ?? "YES"),
+    comment: row[3] === null ? null : String(row[3]),
   }));
-  const count = tableToRows(await connection.query(`SELECT count(*) FROM ${relation}`));
-  return { columns, rowCount: Number(count.rows[0]?.[0] ?? 0) };
 }
 
 export async function registerDuckDBSource(
@@ -241,11 +262,12 @@ export async function registerDuckDBSource(
     ];
     const columnRows = tableToRows(
       await connection.query(
-        `SELECT table_schema, table_name, column_name, data_type, is_nullable ` +
-          `FROM information_schema.columns ` +
-          `WHERE table_catalog = ${quoteString(databaseAlias)} ` +
-          `AND table_schema NOT IN ('information_schema', 'pg_catalog') ` +
-          `ORDER BY table_schema, table_name, ordinal_position`,
+        `SELECT schema_name, table_name, column_name, data_type, ` +
+          `CASE WHEN is_nullable THEN 'YES' ELSE 'NO' END, comment ` +
+          `FROM duckdb_columns() ` +
+          `WHERE database_name = ${quoteString(databaseAlias)} ` +
+          `AND schema_name NOT IN ('information_schema', 'pg_catalog') ` +
+          `ORDER BY schema_name, table_name, column_index`,
       ),
     ).rows;
     const metadata = objects.map((object) => ({
@@ -257,6 +279,7 @@ export async function registerDuckDBSource(
           name: String(row[2] ?? ""),
           type: String(row[3] ?? "UNKNOWN"),
           nullable: String(row[4] ?? "YES"),
+          comment: row[5] === null ? null : String(row[5]),
         })),
     }));
     if (metadata.length === 0) {

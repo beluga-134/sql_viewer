@@ -456,12 +456,21 @@ function renderSchema(): void {
     const row = document.createElement("button");
     row.type = "button";
     row.className = "schema-row";
-    row.title = `${column.name} · ${column.type}`;
+    const comment = column.comment?.trim() ?? "";
+    row.title = comment ? `${column.name} · ${column.type}\n${comment}` : `${column.name} · ${column.type}`;
+    const copy = document.createElement("span");
+    copy.className = "schema-column-copy";
     const name = document.createElement("span");
     name.textContent = column.name;
+    copy.append(name);
+    if (comment) {
+      const description = document.createElement("small");
+      description.textContent = shortColumnComment(comment);
+      copy.append(description);
+    }
     const type = document.createElement("em");
     type.textContent = column.type;
-    row.append(name, type);
+    row.append(copy, type);
     row.addEventListener("click", () => {
       const start = editor.selectionStart;
       const end = editor.selectionEnd;
@@ -472,6 +481,30 @@ function renderSchema(): void {
     });
     schemaList.append(row);
   }
+}
+
+function shortColumnComment(comment: string): string {
+  const characters = Array.from(comment.trim());
+  return characters.length > 20 ? `${characters.slice(0, 20).join("")}...` : characters.join("");
+}
+
+function resolveColumnComments(columns: string[], sql: string): Array<string | null> {
+  const referencedSources = sources.filter((source) => sql.includes(source.sqlName));
+  const directSource = referencedSources.length === 1 ? referencedSources[0] : null;
+  return columns.map((name) => {
+    const directComment = directSource
+      ? directSource.columns.find((column) => column.name === name)?.comment?.trim()
+      : undefined;
+    if (directComment) return directComment;
+    const matchingColumns = sources.flatMap((source) =>
+      source.columns.filter((column) => column.name === name),
+    );
+    if (matchingColumns.length === 0) return null;
+    const comments = new Set(matchingColumns.map((column) => column.comment?.trim()).filter(Boolean));
+    return comments.size === 1 && matchingColumns.every((column) => column.comment?.trim())
+      ? Array.from(comments)[0]!
+      : null;
+  });
 }
 
 function renderSources(): void {
@@ -598,7 +631,7 @@ function renderSources(): void {
     const matchingSources = groupMatches
       ? group.sources
       : group.sources.filter((source) =>
-        `${source.name} ${source.alias} ${source.schema ?? ""} ${source.objectName ?? ""} ${source.columns.map((column) => column.name).join(" ")}`
+        `${source.name} ${source.alias} ${source.schema ?? ""} ${source.objectName ?? ""} ${source.columns.map((column) => `${column.name} ${column.comment ?? ""}`).join(" ")}`
           .toLocaleLowerCase()
           .includes(filter),
       );
@@ -719,7 +752,9 @@ function renderSources(): void {
         leafName.textContent = source.objectName ?? source.alias;
         const leafDetails = document.createElement("small");
         const matchingColumns = filter
-          ? source.columns.filter((column) => column.name.toLocaleLowerCase().includes(filter))
+          ? source.columns.filter((column) =>
+            `${column.name} ${column.comment ?? ""}`.toLocaleLowerCase().includes(filter),
+          )
           : [];
         const metadata = matchingColumns.length > 0
           ? `字段 · ${matchingColumns.map((column) => column.name).join(", ")}`
@@ -831,6 +866,7 @@ function renderResult(): void {
 
   const table = document.createElement("table");
   table.className = "result-table";
+  table.classList.toggle("has-column-comments", currentResult.columnComments?.some(Boolean) ?? false);
   const thead = document.createElement("thead");
   const headerRow = document.createElement("tr");
   const numberHeader = document.createElement("th");
@@ -849,9 +885,20 @@ function renderResult(): void {
     const th = document.createElement("th");
     const name = document.createElement("strong");
     name.textContent = column;
+    const commentText = currentResult!.columnComments?.[index]?.trim() ?? "";
+    if (commentText) {
+      const comment = document.createElement("span");
+      comment.className = "column-comment";
+      comment.textContent = shortColumnComment(commentText);
+      comment.title = commentText;
+      th.append(name, comment);
+    } else {
+      th.append(name);
+    }
     const type = document.createElement("span");
+    type.className = "column-type";
     type.textContent = currentResult!.columnTypes[index] ?? "";
-    th.title = `${column} · ${type.textContent}`;
+    th.title = commentText ? `${column} · ${type.textContent}\n${commentText}` : `${column} · ${type.textContent}`;
     const filter = document.createElement("input");
     filter.type = "search";
     filter.className = "column-filter";
@@ -859,7 +906,7 @@ function renderResult(): void {
     filter.placeholder = "筛选";
     filter.autocomplete = "off";
     filter.setAttribute("aria-label", `筛选列 ${column}`);
-    th.append(name, type, filter);
+    th.append(type, filter);
     headerRow.append(th);
   });
   thead.append(headerRow);
@@ -1256,6 +1303,7 @@ async function runQuery(): Promise<void> {
   cancelRequested = false;
   try {
     currentResult = isTauriRuntime() ? await executeNativeSql(sql, nativeQuerySources()) : await executeSql(sql);
+    currentResult.columnComments = resolveColumnComments(currentResult.columns, sql);
     columnFilters = currentResult.columns.map(() => "");
     saveHistory(sql);
     renderResult();
