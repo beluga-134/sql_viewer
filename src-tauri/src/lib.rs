@@ -1,5 +1,6 @@
 use serde::Serialize;
 use std::path::Path;
+use tauri::{Emitter, Manager};
 
 mod native_db;
 
@@ -61,6 +62,26 @@ fn collect_database_files(directory: &Path, files: &mut Vec<String>) -> Result<(
     Ok(())
 }
 
+fn valid_file_args(args: &[String]) -> Vec<String> {
+    let mut files: Vec<String> = Vec::new();
+    for arg in args {
+        let path = Path::new(arg);
+        let is_supported_file = allowed_extension(path)
+            && std::fs::metadata(path)
+                .map(|metadata| metadata.is_file())
+                .unwrap_or(false);
+        if is_supported_file && !files.iter().any(|item| item.eq_ignore_ascii_case(arg)) {
+            files.push(arg.clone());
+        }
+    }
+    files
+}
+
+#[tauri::command]
+fn get_startup_file_args() -> Vec<String> {
+    valid_file_args(&std::env::args().collect::<Vec<String>>())
+}
+
 #[tauri::command(async)]
 fn list_database_files(path: String) -> Result<Vec<String>, String> {
     let directory = Path::new(&path);
@@ -115,10 +136,22 @@ fn write_binary_file(path: String, data: Vec<u8>) -> Result<(), String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            let paths = valid_file_args(&args);
+            if !paths.is_empty() {
+                let _ = app.emit("open-paths", paths);
+            }
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.unminimize();
+                let _ = window.show();
+                let _ = window.set_focus();
+            }
+        }))
         .plugin(tauri_plugin_dialog::init())
         .manage(native_db::NativeAppState::default())
         .invoke_handler(tauri::generate_handler![
             get_local_file_info,
+            get_startup_file_args,
             list_database_files,
             write_binary_file,
             native_db::list_native_objects,
@@ -142,5 +175,15 @@ mod tests {
         assert!(allowed_extension(Path::new("sample.jsonl")));
         assert!(allowed_extension(Path::new("sample.duckdb")));
         assert!(!allowed_extension(Path::new("sample.xlsx")));
+    }
+
+    #[test]
+    fn filters_missing_or_unsupported_arguments() {
+        let args: Vec<String> = vec![
+            "sql-viewer.exe".into(),
+            "--flag".into(),
+            "definitely-missing-8f3c.duckdb".into(),
+        ];
+        assert!(valid_file_args(&args).is_empty());
     }
 }

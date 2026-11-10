@@ -68,6 +68,17 @@ export async function getLocalFileInfo(path: string): Promise<LocalFilePayload> 
   return invoke<LocalFilePayload>("get_local_file_info", { path });
 }
 
+export async function getStartupFileArgs(): Promise<string[]> {
+  if (!isTauriRuntime()) return [];
+  return invoke<string[]>("get_startup_file_args");
+}
+
+export async function onOpenPaths(handler: (paths: string[]) => void): Promise<void> {
+  if (!isTauriRuntime()) return;
+  const { listen } = await import("@tauri-apps/api/event");
+  await listen<string[]>("open-paths", (event) => handler(event.payload ?? []));
+}
+
 export async function listNativeObjects(source: NativeSourceSpec): Promise<NativeObject[]> {
   return invoke<NativeObject[]>("list_native_objects", { source });
 }

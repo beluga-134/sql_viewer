@@ -29,10 +29,12 @@ import {
   describeNativeObject,
   executeNativeSql,
   getLocalFileInfo,
+  getStartupFileArgs,
   listDatabaseFiles,
   isTauriRuntime,
   listNativeObjectColumns,
   listNativeObjects,
+  onOpenPaths,
   saveWorkbook,
 } from "./backend";
 import type { NativeSourceSpec } from "./backend";
@@ -211,6 +213,7 @@ let busy = false;
 let queryRunning = false;
 let toastTimer = 0;
 let cancelRequested = false;
+let pendingOpenPaths: string[] = [];
 let columnFilters: string[] = [];
 const expandedSourceGroups = new Set<string>();
 const expandedSchemas = new Set<string>();
@@ -223,6 +226,7 @@ type SourceGroup = { key: string; label: string; sources: DataSource[] };
 
 const HISTORY_KEY = "sql-viewer.query-history.v1";
 const RECENT_DATABASES_KEY = "sql-viewer.recent-databases.v1";
+const SELECTED_SOURCE_KEY = "sql-viewer.selected-source.v1";
 const PROJECT_DIRECTORIES_KEY = "sql-viewer.project-directories.v1";
 const PROJECT_FOLDERS_KEY = "sql-viewer.project-folders.v1";
 const SOURCES_KEY = "sql-viewer.sources.v1";
@@ -271,6 +275,18 @@ let projectFolders = readStoredList<ProjectFolder>(PROJECT_FOLDERS_KEY)
 sources = readStoredList<DataSource>(SOURCES_KEY)
   .filter((item) => item && item.native === true && typeof item.id === "string" && typeof item.path === "string" && typeof item.sqlName === "string")
   .filter((item) => !item.projectFolderId || projectFolders.some((folder) => folder.id === item.projectFolderId));
+const storedSelectedSourceId = (() => {
+  try {
+    return localStorage.getItem(SELECTED_SOURCE_KEY) ?? "";
+  } catch {
+    return "";
+  }
+})();
+if (storedSelectedSourceId && sources.some((source) => source.id === storedSelectedSourceId)) {
+  selectedSourceId = storedSelectedSourceId;
+} else {
+  selectedSourceId = sources.at(-1)?.id ?? null;
+}
 function saveProjectState(): void {
   localStorage.setItem(PROJECT_DIRECTORIES_KEY, JSON.stringify(projectDirectories));
   localStorage.setItem(PROJECT_FOLDERS_KEY, JSON.stringify(projectFolders));
@@ -279,6 +295,13 @@ function saveProjectState(): void {
 function saveSources(): void {
   try {
     localStorage.setItem(SOURCES_KEY, JSON.stringify(sources.filter((source) => source.native && source.path)));
+  } catch {
+  }
+}
+
+function saveSelection(): void {
+  try {
+    localStorage.setItem(SELECTED_SOURCE_KEY, selectedSourceId ?? "");
   } catch {
   }
 }
@@ -318,7 +341,7 @@ function renderRecentDatabases(): void {
     item.addEventListener("click", () => {
       if (busy || !engineReady) return;
       closeRecentDatabases();
-      void addNativeSources([path]);
+      void openRequestedPaths([path]);
     });
     recentDatabaseMenu.append(item);
   }
@@ -981,12 +1004,57 @@ async function loadSourceMetadata(source: DataSource): Promise<void> {
 async function selectSource(source: DataSource): Promise<void> {
   if (busy) return;
   selectedSourceId = source.id;
+  saveSelection();
   editor.value = defaultQuery(source.sqlName);
   renderSources();
   renderSchema();
   setBusy(false);
   editor.focus();
   await loadSourceMetadata(source);
+}
+
+function sourceGroupKey(source: DataSource): string {
+  if (source.databaseId) return `database:${source.databaseId}`;
+  if (source.path) return `file:${source.path}`;
+  return `source:${source.id}`;
+}
+
+function expandDatabaseSources(targets: DataSource[]): void {
+  for (const source of targets) {
+    const groupKey = sourceGroupKey(source);
+    expandedSourceGroups.add(groupKey);
+    if (source.format === "duckdb" && source.schema) {
+      expandedSchemas.add(`${groupKey}\0${source.schema}`);
+    }
+  }
+}
+
+async function openRequestedPaths(requestedPaths: string[]): Promise<void> {
+  if (!engineReady || busy) return;
+  const paths = requestedPaths.filter(
+    (path, index) =>
+      requestedPaths.findIndex((item) => item.toLocaleLowerCase() === path.toLocaleLowerCase()) === index,
+  );
+  if (paths.length === 0) return;
+  const lowered = paths.map((path) => path.toLocaleLowerCase());
+  const staleIds = new Set(
+    sources
+      .filter((source) => source.path && lowered.includes(source.path.toLocaleLowerCase()))
+      .map((source) => source.id),
+  );
+  if (staleIds.size > 0) {
+    sources = sources.filter((source) => !staleIds.has(source.id));
+    if (selectedSourceId && staleIds.has(selectedSourceId)) selectedSourceId = null;
+    saveSources();
+    renderSources();
+  }
+  const previousCount = sources.length;
+  await addNativeSources(paths);
+  const addedSources = sources.slice(previousCount);
+  if (addedSources.length > 0) {
+    expandDatabaseSources(addedSources);
+    renderSources();
+  }
 }
 
 async function addNativeSources(paths: string[], projectFolderId?: string): Promise<void> {
@@ -1051,6 +1119,7 @@ async function addNativeSources(paths: string[], projectFolderId?: string): Prom
   }
   renderSources();
   saveSources();
+  saveSelection();
   setBusy(false, added > 0 ? `已加载 ${sources.length} 个数据源对象` : "未加载数据源");
   editor.focus();
 }
@@ -1143,7 +1212,7 @@ async function openSources(): Promise<void> {
   try {
     const paths = await chooseSourcePaths();
     if (paths.length === 0) return;
-    await addNativeSources(paths);
+    await openRequestedPaths(paths);
   } catch (error) {
     setBusy(false, "打开文件失败");
     showToast(error instanceof Error ? error.message : "打开文件失败", "error");
@@ -1221,6 +1290,7 @@ async function removeProjectFolder(folder: ProjectFolder): Promise<void> {
   saveProjectState();
   if (selectedSourceId && !sources.some((source) => source.id === selectedSourceId)) {
     selectedSourceId = sources.at(-1)?.id ?? null;
+    saveSelection();
   }
   renderSources();
   setBusy(false, `已移除项目文件夹：${folder.name}`);
@@ -1236,6 +1306,7 @@ function removeProjectDirectory(directory: ProjectDirectory): void {
   saveSources();
   if (selectedSourceId && !sources.some((source) => source.id === selectedSourceId)) {
     selectedSourceId = sources.at(-1)?.id ?? null;
+    saveSelection();
   }
   saveProjectState();
   renderSources();
@@ -1274,6 +1345,7 @@ async function removeSource(source: DataSource): Promise<void> {
     saveSources();
     if (removedSelected) {
       selectedSourceId = sources.at(-1)?.id ?? null;
+      saveSelection();
       const next = selectedSource();
       if (next) editor.value = defaultQuery(next.sqlName);
     }
@@ -1408,7 +1480,7 @@ async function initializeDropHandling(): Promise<void> {
         dropOverlay.hidden = false;
       } else if (event.payload.type === "drop") {
         dropOverlay.hidden = true;
-        void addNativeSources(event.payload.paths);
+        void openRequestedPaths(event.payload.paths);
       } else {
         dropOverlay.hidden = true;
       }
@@ -1446,11 +1518,34 @@ async function start(): Promise<void> {
     engineState.innerHTML = `<i data-lucide="circle-check"></i><span>${isTauriRuntime() ? "原生 DuckDB 就绪" : "DuckDB-WASM 就绪"}</span>`;
     createIcons({ icons: iconSet });
     setBusy(false, "DuckDB 已就绪");
-    const firstSource = selectedSource() ?? sources.at(0) ?? null;
-    if (firstSource) {
-      selectedSourceId = firstSource.id;
-      editor.value = defaultQuery(firstSource.sqlName);
-      renderSources();
+    if (isTauriRuntime()) {
+      await onOpenPaths((paths) => {
+        if (!engineReady) {
+          pendingOpenPaths.push(...paths);
+          return;
+        }
+        void openRequestedPaths(paths);
+      });
+    }
+    const requestedPaths = isTauriRuntime()
+      ? [...(await getStartupFileArgs()), ...pendingOpenPaths]
+      : [];
+    pendingOpenPaths = [];
+    const uniqueRequested = requestedPaths.filter(
+      (path, index) =>
+        requestedPaths.findIndex((item) => item.toLocaleLowerCase() === path.toLocaleLowerCase()) === index,
+    );
+    if (uniqueRequested.length > 0) {
+      await openRequestedPaths(uniqueRequested);
+    } else if (sources.length > 0) {
+      const firstSource = selectedSource();
+      if (firstSource) {
+        editor.value = defaultQuery(firstSource.sqlName);
+        expandDatabaseSources([firstSource]);
+        renderSources();
+      }
+    } else if (isTauriRuntime() && projectFolders.length === 0 && recentDatabasePaths.length > 0) {
+      await openRequestedPaths([recentDatabasePaths[0]]);
     }
     editor.focus();
     if (isTauriRuntime() && projectFolders.length > 0 && sources.length === 0) {
